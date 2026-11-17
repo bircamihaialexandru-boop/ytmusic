@@ -38,7 +38,7 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
     let browserButton = ReactiveIconButton()
     let fullScreenButton = ReactiveIconButton()
     let resetPositionButton = ReactiveIconButton()
-    let visualEffectBackdrop = NSVisualEffectView()
+    let visualEffectBackdrop = AppleGlassView()
     let glassSheenLayer = CAGradientLayer()
     let cylindricalLensLayer = CAGradientLayer()
     let liquidFluidMeshLayer = CAGradientLayer()
@@ -219,7 +219,7 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
 
 
     
-    let toastView = NSView()
+    let toastView = AppleGlassView()
     let toastLabel = NSTextField(labelWithString: "")
     var toastDismissTimer: Timer?
     
@@ -358,12 +358,9 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
         }
 
         visualEffectBackdrop.translatesAutoresizingMaskIntoConstraints = false
-        visualEffectBackdrop.material = .underWindowBackground
         visualEffectBackdrop.blendingMode = .behindWindow
-        visualEffectBackdrop.state = .active
-        visualEffectBackdrop.wantsLayer = true
-        visualEffectBackdrop.layer?.cornerRadius = 20
-        visualEffectBackdrop.layer?.masksToBounds = true
+        visualEffectBackdrop.cornerRadius = 20
+        visualEffectBackdrop.style = .dark
         visualEffectBackdrop.isHidden = true
         containerPill.addSubview(visualEffectBackdrop, positioned: .below, relativeTo: nil)
         NSLayoutConstraint.activate([
@@ -550,11 +547,9 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
         timeLabel.isSelectable = false
         timeLabel.refusesFirstResponder = true
         
-        toastView.wantsLayer = true
-        toastView.layer?.backgroundColor = NSColor(red: 0.12, green: 0.12, blue: 0.15, alpha: 0.96).cgColor
-        toastView.layer?.cornerRadius = 10
-        toastView.layer?.borderWidth = 1.0
-        toastView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.20).cgColor
+        toastView.blendingMode = .withinWindow
+        toastView.cornerRadius = 12
+        toastView.style = .dark
         toastView.alphaValue = 0.0
         toastView.isHidden = true
         toastView.translatesAutoresizingMaskIntoConstraints = false

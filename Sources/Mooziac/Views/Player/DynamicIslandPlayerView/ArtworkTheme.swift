@@ -148,6 +148,8 @@ extension DynamicIslandPlayerView {
                         self.containerPill.layer?.borderColor = borderGlow.cgColor
                         self.waveformProgressView.accentColor = dominantColor
                     }
+                } else if PlayerDesign.current == .liquidFluid {
+                    self.visualEffectBackdrop.style = .adaptive(accent: dominantColor)
                 }
             }
         }
@@ -223,13 +225,33 @@ extension DynamicIslandPlayerView {
                 resetPositionButton.contentTintColor = darkBtnTint
 
             case .glassMode:
-                visualEffectBackdrop.isHidden = true
-                glassSheenLayer.isHidden = true
-                cylindricalLensLayer.isHidden = true
-                // Premium Light Mode #EFF2F0 with high-contrast text and crisp perimeter rim
-                containerPill.layer?.backgroundColor = NSColor(red: 0.93725, green: 0.94902, blue: 0.94118, alpha: 0.98).cgColor
+                visualEffectBackdrop.isHidden = false
+                visualEffectBackdrop.style = .crystal
+                glassSheenLayer.isHidden = false
+                glassSheenLayer.frame = containerPill.bounds
+                glassSheenLayer.colors = [
+                    NSColor(white: 1.0, alpha: 0.85).cgColor,
+                    NSColor(white: 1.0, alpha: 0.32).cgColor,
+                    NSColor(white: 1.0, alpha: 0.00).cgColor,
+                    NSColor(white: 1.0, alpha: 0.22).cgColor
+                ]
+                glassSheenLayer.locations = [0.0, 0.14, 0.86, 1.0]
+
+                cylindricalLensLayer.isHidden = false
+                cylindricalLensLayer.frame = containerPill.bounds
+                cylindricalLensLayer.colors = [
+                    NSColor(white: 1.0, alpha: 0.00).cgColor,
+                    NSColor(white: 1.0, alpha: 0.22).cgColor,
+                    NSColor(white: 1.0, alpha: 0.55).cgColor,
+                    NSColor(white: 1.0, alpha: 0.18).cgColor,
+                    NSColor(white: 0.0, alpha: 0.03).cgColor,
+                    NSColor(white: 1.0, alpha: 0.00).cgColor
+                ]
+                cylindricalLensLayer.locations = [0.0, 0.18, 0.36, 0.44, 0.50, 1.0]
+
+                containerPill.layer?.backgroundColor = NSColor.clear.cgColor
                 containerPill.layer?.borderWidth = 1.2
-                containerPill.layer?.borderColor = NSColor(red: 0.70, green: 0.72, blue: 0.71, alpha: 1.0).cgColor
+                containerPill.layer?.borderColor = NSColor(white: 1.0, alpha: 0.72).cgColor
                 
                 titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .heavy)
                 artistLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
@@ -261,9 +283,8 @@ extension DynamicIslandPlayerView {
                 // Apple Control Center Optical Liquid Glass: Behind-window blur, 3D meniscus acrylic rim, cylindrical lens flare
                 let isDark = SystemAppearanceHelper.isDarkSystemAppearance
                 visualEffectBackdrop.isHidden = false
-                visualEffectBackdrop.material = isDark ? .hudWindow : .popover
                 visualEffectBackdrop.blendingMode = .behindWindow
-                visualEffectBackdrop.state = .active
+                visualEffectBackdrop.style = .adaptive(accent: lastAmbientAccentColor)
                 
                 // Convex meniscus rim with top glint & bottom internal bounce reflection
                 glassSheenLayer.isHidden = false

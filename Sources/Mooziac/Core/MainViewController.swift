@@ -57,13 +57,17 @@ class MainViewController: NSViewController, DynamicIslandPlayerViewDelegate, Hea
         
         browserContainerView.translatesAutoresizingMaskIntoConstraints = false
         browserContainerView.wantsLayer = true
-        browserContainerView.layer?.backgroundColor = NSColor(red: 0.08, green: 0.08, blue: 0.10, alpha: 0.98).cgColor
+        browserContainerView.layer?.backgroundColor = NSColor.clear.cgColor
         browserContainerView.layer?.cornerRadius = 20.0
         browserContainerView.layer?.masksToBounds = true
-        browserContainerView.layer?.borderWidth = 1.0
-        browserContainerView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.15).cgColor
         browserContainerView.alphaValue = 0.001
         browserContainerView.isHidden = false
+
+        let browserGlassBackdrop = AppleGlassView()
+        browserGlassBackdrop.translatesAutoresizingMaskIntoConstraints = false
+        browserGlassBackdrop.blendingMode = .behindWindow
+        browserGlassBackdrop.cornerRadius = 20.0
+        browserGlassBackdrop.style = .dark
         
         headerView.translatesAutoresizingMaskIntoConstraints = false
         headerView.delegate = self
@@ -71,6 +75,7 @@ class MainViewController: NSViewController, DynamicIslandPlayerViewDelegate, Hea
         
         webViewContainer.translatesAutoresizingMaskIntoConstraints = false
         
+        browserContainerView.addSubview(browserGlassBackdrop)
         browserContainerView.addSubview(headerView)
         browserContainerView.addSubview(webViewContainer)
         
@@ -84,6 +89,11 @@ class MainViewController: NSViewController, DynamicIslandPlayerViewDelegate, Hea
             browserContainerView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             browserContainerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             browserContainerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+            browserGlassBackdrop.topAnchor.constraint(equalTo: browserContainerView.topAnchor),
+            browserGlassBackdrop.bottomAnchor.constraint(equalTo: browserContainerView.bottomAnchor),
+            browserGlassBackdrop.leadingAnchor.constraint(equalTo: browserContainerView.leadingAnchor),
+            browserGlassBackdrop.trailingAnchor.constraint(equalTo: browserContainerView.trailingAnchor),
             
             headerView.topAnchor.constraint(equalTo: browserContainerView.topAnchor),
             headerView.leadingAnchor.constraint(equalTo: browserContainerView.leadingAnchor),

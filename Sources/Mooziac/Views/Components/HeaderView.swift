@@ -34,7 +34,19 @@ class HeaderView: NSView {
     
     private func setupUI() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor(red: 0.11, green: 0.11, blue: 0.13, alpha: 0.98).cgColor
+        layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.04).cgColor
+
+        let bottomHairline = NSView()
+        bottomHairline.translatesAutoresizingMaskIntoConstraints = false
+        bottomHairline.wantsLayer = true
+        bottomHairline.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.12).cgColor
+        addSubview(bottomHairline)
+        NSLayoutConstraint.activate([
+            bottomHairline.leadingAnchor.constraint(equalTo: leadingAnchor),
+            bottomHairline.trailingAnchor.constraint(equalTo: trailingAnchor),
+            bottomHairline.bottomAnchor.constraint(equalTo: bottomAnchor),
+            bottomHairline.heightAnchor.constraint(equalToConstant: 0.5)
+        ])
         
         setupIconButton(backButton, systemName: "chevron.left", toolTip: "Back", action: #selector(backTapped))
         setupIconButton(forwardButton, systemName: "chevron.right", toolTip: "Forward", action: #selector(forwardTapped))

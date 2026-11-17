@@ -352,10 +352,13 @@ public class OfflineLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSou
                 openFolderButton.contentTintColor = SystemAppearanceHelper.controlButtonTint(for: .darkMode)
 
             case .glassMode:
-                visualEffectBackdrop.isHidden = true
-                layer?.backgroundColor = NSColor(red: 0.93725, green: 0.94902, blue: 0.94118, alpha: 0.98).cgColor
-                layer?.borderWidth = 1.0
-                layer?.borderColor = NSColor(red: 0.78, green: 0.80, blue: 0.79, alpha: 0.90).cgColor
+                visualEffectBackdrop.isHidden = false
+                visualEffectBackdrop.material = .popover
+                visualEffectBackdrop.blendingMode = .behindWindow
+                visualEffectBackdrop.state = .active
+                layer?.backgroundColor = NSColor(red: 0.94, green: 0.96, blue: 0.97, alpha: 0.58).cgColor
+                layer?.borderWidth = 1.2
+                layer?.borderColor = NSColor(white: 1.0, alpha: 0.72).cgColor
 
                 let pitchBlack = SystemAppearanceHelper.primaryTextColor(for: .glassMode)
                 headerTitleLabel.textColor = pitchBlack

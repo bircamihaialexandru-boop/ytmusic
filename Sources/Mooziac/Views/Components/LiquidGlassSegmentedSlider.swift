@@ -257,8 +257,8 @@ final class LiquidSegmentedControl: NSView {
         thumbHighlight.cornerRadius = h / 2
         if animated {
             NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.25
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                ctx.duration = 0.28
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 1.18, 0.36, 1.0)
                 ctx.allowsImplicitAnimation = true
                 thumbView.animator().frame = targetRect
             }
