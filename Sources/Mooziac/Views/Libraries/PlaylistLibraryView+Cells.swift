@@ -1197,3 +1197,386 @@ class LikedSongRowCellView: NSTableCellView {
         onOptionsTapped?(optionsButton)
     }
 }
+
+// MARK: - Search Section Header Cell View
+class PlaylistSearchSectionHeaderCellView: NSTableCellView {
+    private let titleLabel = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupUI()
+    }
+
+    private func setupUI() {
+        wantsLayer = true
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = NSFont.systemFont(ofSize: 10.0, weight: .bold)
+        titleLabel.isEditable = false
+        titleLabel.isSelectable = false
+        titleLabel.refusesFirstResponder = true
+        addSubview(titleLabel)
+
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
+            titleLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2)
+        ])
+    }
+
+    func configure(title: String, design: PlayerDesign) {
+        titleLabel.stringValue = title
+        let isLight = (design == .glassMode || (design == .liquidFluid && !SystemAppearanceHelper.isDarkSystemAppearance))
+        titleLabel.textColor = isLight
+            ? NSColor(white: 0.25, alpha: 0.85)
+            : SystemAppearanceHelper.secondaryTextColor(for: design).withAlphaComponent(0.9)
+    }
+}
+
+// MARK: - Search Status Cell View
+class PlaylistSearchStatusCellView: NSTableCellView {
+    private let statusLabel = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupUI()
+    }
+
+    private func setupUI() {
+        wantsLayer = true
+        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.font = NSFont.systemFont(ofSize: 11.0, weight: .regular)
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.isEditable = false
+        statusLabel.isSelectable = false
+        statusLabel.refusesFirstResponder = true
+        addSubview(statusLabel)
+
+        NSLayoutConstraint.activate([
+            statusLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
+            statusLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+    }
+
+    func configure(text: String, design: PlayerDesign) {
+        statusLabel.stringValue = text
+        let isLight = (design == .glassMode || (design == .liquidFluid && !SystemAppearanceHelper.isDarkSystemAppearance))
+        statusLabel.textColor = isLight
+            ? NSColor(white: 0.35, alpha: 1.0)
+            : SystemAppearanceHelper.secondaryTextColor(for: design)
+    }
+}
+
+// MARK: - Search Track Cell View (Account & YouTube Music Tracks)
+class PlaylistSearchTrackCellView: NSTableCellView {
+    private let cardView = InteractiveSearchCardView()
+    private let playButton = ReactiveIconButton()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let subtitleLabel = NSTextField(labelWithString: "")
+    private let addButton = ReactiveIconButton()
+
+    var onPlay: (() -> Void)?
+    var onAddTapped: ((NSButton) -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupUI()
+    }
+
+    private func setupUI() {
+        wantsLayer = true
+        cardView.translatesAutoresizingMaskIntoConstraints = false
+        cardView.wantsLayer = true
+        cardView.layer?.cornerRadius = 8
+        cardView.layer?.borderWidth = 1.0
+        cardView.onClick = { [weak self] in
+            self?.onPlay?()
+        }
+        addSubview(cardView)
+
+        playButton.translatesAutoresizingMaskIntoConstraints = false
+        playButton.isBordered = false
+        let playConfig = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .bold)
+        playButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")?.withSymbolConfiguration(playConfig)
+        playButton.toolTip = "Play"
+        playButton.target = self
+        playButton.action = #selector(handlePlayTapped)
+
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = NSFont.systemFont(ofSize: 12.0, weight: .semibold)
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.usesSingleLineMode = true
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.isEditable = false
+        titleLabel.isSelectable = false
+        titleLabel.refusesFirstResponder = true
+
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        subtitleLabel.font = NSFont.systemFont(ofSize: 10.0, weight: .regular)
+        subtitleLabel.maximumNumberOfLines = 1
+        subtitleLabel.usesSingleLineMode = true
+        subtitleLabel.lineBreakMode = .byTruncatingTail
+        subtitleLabel.isEditable = false
+        subtitleLabel.isSelectable = false
+        subtitleLabel.refusesFirstResponder = true
+
+        let textStack = NSStackView(views: [titleLabel, subtitleLabel])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 0
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        addButton.translatesAutoresizingMaskIntoConstraints = false
+        addButton.isBordered = false
+        let addConfig = NSImage.SymbolConfiguration(pointSize: 11.0, weight: .bold)
+        addButton.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add to Playlist")?.withSymbolConfiguration(addConfig)
+        addButton.toolTip = "Add to Playlist"
+        addButton.target = self
+        addButton.action = #selector(handleAddButtonTapped)
+
+        cardView.addSubview(playButton)
+        cardView.addSubview(textStack)
+        cardView.addSubview(addButton)
+
+        NSLayoutConstraint.activate([
+            cardView.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            cardView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            cardView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            cardView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+
+            playButton.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 10),
+            playButton.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            playButton.widthAnchor.constraint(equalToConstant: 20),
+            playButton.heightAnchor.constraint(equalToConstant: 20),
+
+            textStack.leadingAnchor.constraint(equalTo: playButton.trailingAnchor, constant: 8),
+            textStack.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            textStack.trailingAnchor.constraint(lessThanOrEqualTo: addButton.leadingAnchor, constant: -8),
+
+            addButton.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -8),
+            addButton.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            addButton.widthAnchor.constraint(equalToConstant: 22),
+            addButton.heightAnchor.constraint(equalToConstant: 22)
+        ])
+    }
+
+    func configure(title: String, subtitle: String, design: PlayerDesign) {
+        titleLabel.stringValue = title
+        subtitleLabel.stringValue = subtitle
+        applyCardStyle(design: design)
+    }
+
+    private func applyCardStyle(design: PlayerDesign) {
+        let isLight = (design == .glassMode || (design == .liquidFluid && !SystemAppearanceHelper.isDarkSystemAppearance))
+        let isLiquidDark = (design == .liquidFluid && SystemAppearanceHelper.isDarkSystemAppearance)
+        let isDark = (design == .darkMode)
+        let cyan = isLight ? NSColor.lightThemeSelector : NSColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
+
+        if isLight {
+            cardView.layer?.backgroundColor = NSColor(white: 0.0, alpha: 0.02).cgColor
+            cardView.layer?.borderColor = NSColor(white: 0.0, alpha: 0.08).cgColor
+            titleLabel.textColor = NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1.0)
+            subtitleLabel.textColor = NSColor(white: 0.35, alpha: 1.0)
+            playButton.contentTintColor = cyan
+            addButton.contentTintColor = cyan
+        } else if isLiquidDark {
+            cardView.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.16).cgColor
+            cardView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.20).cgColor
+            titleLabel.textColor = NSColor.white
+            subtitleLabel.textColor = NSColor(white: 0.88, alpha: 1.0)
+            playButton.contentTintColor = NSColor.white
+            addButton.contentTintColor = NSColor.white
+        } else {
+            cardView.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.04).cgColor
+            cardView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.08).cgColor
+            titleLabel.textColor = NSColor.white
+            subtitleLabel.textColor = isDark ? NSColor(white: 0.55, alpha: 1.0) : NSColor(white: 0.65, alpha: 1.0)
+            playButton.contentTintColor = cyan
+            addButton.contentTintColor = cyan
+        }
+    }
+
+    @objc private func handlePlayTapped() {
+        onPlay?()
+    }
+
+    @objc private func handleAddButtonTapped() {
+        onAddTapped?(addButton)
+    }
+}
+
+// MARK: - Search Playlist Cell View (Account & YouTube Music Playlists)
+class PlaylistSearchPlaylistCellView: NSTableCellView {
+    private let cardView = InteractiveSearchCardView()
+    private let artImageView = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let subtitleLabel = NSTextField(labelWithString: "")
+    private let importButton = ReactiveIconButton()
+
+    private var currentArtworkUrl: String = ""
+    var onOpenPlaylist: (() -> Void)?
+    var onImportTapped: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupUI()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupUI()
+    }
+
+    private func setupUI() {
+        wantsLayer = true
+        cardView.translatesAutoresizingMaskIntoConstraints = false
+        cardView.wantsLayer = true
+        cardView.layer?.cornerRadius = 8
+        cardView.layer?.borderWidth = 1.0
+        cardView.onClick = { [weak self] in
+            self?.onOpenPlaylist?()
+        }
+        addSubview(cardView)
+
+        artImageView.translatesAutoresizingMaskIntoConstraints = false
+        artImageView.imageScaling = .scaleProportionallyDown
+        artImageView.wantsLayer = true
+        artImageView.layer?.cornerRadius = 6
+        artImageView.layer?.masksToBounds = true
+
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = NSFont.systemFont(ofSize: 12.0, weight: .semibold)
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.usesSingleLineMode = true
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.isEditable = false
+        titleLabel.isSelectable = false
+        titleLabel.refusesFirstResponder = true
+
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        subtitleLabel.font = NSFont.systemFont(ofSize: 10.0, weight: .regular)
+        subtitleLabel.maximumNumberOfLines = 1
+        subtitleLabel.usesSingleLineMode = true
+        subtitleLabel.lineBreakMode = .byTruncatingTail
+        subtitleLabel.isEditable = false
+        subtitleLabel.isSelectable = false
+        subtitleLabel.refusesFirstResponder = true
+
+        let textStack = NSStackView(views: [titleLabel, subtitleLabel])
+        textStack.orientation = .vertical
+        textStack.alignment = .leading
+        textStack.spacing = 0
+        textStack.translatesAutoresizingMaskIntoConstraints = false
+
+        importButton.translatesAutoresizingMaskIntoConstraints = false
+        importButton.isBordered = false
+        let importConfig = NSImage.SymbolConfiguration(pointSize: 11.0, weight: .bold)
+        importButton.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Save Playlist")?.withSymbolConfiguration(importConfig)
+        importButton.toolTip = "Save to Your Playlists"
+        importButton.target = self
+        importButton.action = #selector(handleImportButtonTapped)
+
+        cardView.addSubview(artImageView)
+        cardView.addSubview(textStack)
+        cardView.addSubview(importButton)
+
+        NSLayoutConstraint.activate([
+            cardView.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            cardView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            cardView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            cardView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+
+            artImageView.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 8),
+            artImageView.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            artImageView.widthAnchor.constraint(equalToConstant: 28),
+            artImageView.heightAnchor.constraint(equalToConstant: 28),
+
+            textStack.leadingAnchor.constraint(equalTo: artImageView.trailingAnchor, constant: 8),
+            textStack.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            textStack.trailingAnchor.constraint(lessThanOrEqualTo: importButton.leadingAnchor, constant: -8),
+
+            importButton.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -8),
+            importButton.centerYAnchor.constraint(equalTo: cardView.centerYAnchor),
+            importButton.widthAnchor.constraint(equalToConstant: 22),
+            importButton.heightAnchor.constraint(equalToConstant: 22)
+        ])
+    }
+
+    func configure(playlist: YTMClient.SearchPlaylistResult, badge: String, design: PlayerDesign) {
+        titleLabel.stringValue = playlist.title
+        var parts: [String] = []
+        if !playlist.author.isEmpty { parts.append(playlist.author) }
+        if !playlist.trackCountText.isEmpty { parts.append(playlist.trackCountText) }
+        if parts.isEmpty { parts.append(badge) }
+        subtitleLabel.stringValue = parts.joined(separator: " • ")
+
+        let isLight = (design == .glassMode || (design == .liquidFluid && !SystemAppearanceHelper.isDarkSystemAppearance))
+        let isLiquidDark = (design == .liquidFluid && SystemAppearanceHelper.isDarkSystemAppearance)
+        let isDark = (design == .darkMode)
+        let cyan = isLight ? NSColor.lightThemeSelector : NSColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0)
+
+        let placeholderConfig = NSImage.SymbolConfiguration(pointSize: 12.0, weight: .semibold)
+        artImageView.image = NSImage(systemSymbolName: "music.note.list", accessibilityDescription: nil)?.withSymbolConfiguration(placeholderConfig)
+        artImageView.contentTintColor = isLiquidDark ? NSColor.white : cyan
+        artImageView.layer?.backgroundColor = (isLight ? NSColor(white: 0.0, alpha: 0.05) : NSColor(white: 1.0, alpha: 0.08)).cgColor
+
+        if !playlist.artworkUrl.isEmpty, let url = URL(string: playlist.artworkUrl), url.scheme?.hasPrefix("http") == true {
+            if let cached = AppArtworkHelper.shared.getMemoryCachedImage(forKey: playlist.artworkUrl) {
+                artImageView.image = cached
+            } else {
+                currentArtworkUrl = playlist.artworkUrl
+                URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+                    guard let self = self, let data = data, let img = NSImage(data: data) else { return }
+                    AppArtworkHelper.shared.setMemoryCachedImage(img, forKey: playlist.artworkUrl)
+                    DispatchQueue.main.async {
+                        if self.currentArtworkUrl == playlist.artworkUrl {
+                            self.artImageView.image = img
+                        }
+                    }
+                }.resume()
+            }
+        } else {
+            currentArtworkUrl = ""
+        }
+
+        if isLight {
+            cardView.layer?.backgroundColor = NSColor(white: 0.0, alpha: 0.02).cgColor
+            cardView.layer?.borderColor = NSColor(white: 0.0, alpha: 0.08).cgColor
+            titleLabel.textColor = NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1.0)
+            subtitleLabel.textColor = NSColor(white: 0.35, alpha: 1.0)
+            importButton.contentTintColor = cyan
+        } else if isLiquidDark {
+            cardView.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.16).cgColor
+            cardView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.20).cgColor
+            titleLabel.textColor = NSColor.white
+            subtitleLabel.textColor = NSColor(white: 0.88, alpha: 1.0)
+            importButton.contentTintColor = NSColor.white
+        } else {
+            cardView.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.04).cgColor
+            cardView.layer?.borderColor = NSColor(white: 1.0, alpha: 0.08).cgColor
+            titleLabel.textColor = NSColor.white
+            subtitleLabel.textColor = isDark ? NSColor(white: 0.55, alpha: 1.0) : NSColor(white: 0.65, alpha: 1.0)
+            importButton.contentTintColor = cyan
+        }
+    }
+
+    @objc private func handleImportButtonTapped() {
+        onImportTapped?()
+    }
+}
+

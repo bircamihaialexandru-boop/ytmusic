@@ -380,6 +380,7 @@ extension DynamicIslandPlayerView {
         updateBrowserButtonColor()
         updateAddToPlaylistButtonColor()
         updateRepeatButtonColor()
+        updatePinButtonColor()
     }
 
     func setupLiquidFluidLayer() {

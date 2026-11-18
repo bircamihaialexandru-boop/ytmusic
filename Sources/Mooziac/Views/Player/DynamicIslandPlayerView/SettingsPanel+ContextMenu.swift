@@ -713,10 +713,12 @@ extension DynamicIslandPlayerView {
     @objc func handleOpenPlaylistDetail(_ sender: NSClickGestureRecognizer) {
         guard let playlistID = sender.view?.identifier?.rawValue, !playlistID.isEmpty,
               let playlist = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == playlistID }) else { return }
+        resetPlaylistSearchState()
         playlistDetailMode = playlist
         playlistAddMode = false
         isPlaylistSearchActive = true
         isPlaylistCreateOpen = false
+        playlistSearchField?.stringValue = ""
         resetPlaylistSectionChrome()
         applySearchCreateFieldState(animated: false)
         refreshPlaylistsSection()
@@ -724,9 +726,17 @@ extension DynamicIslandPlayerView {
     }
 
     @objc func handleBackFromPlaylistDetail() {
+        playlistSearchDebounceWork?.cancel()
+        playlistSearchGeneration &+= 1
+        cachedYTMSearchQuery = ""
+        cachedYTMSearchResults = nil
+        isYTMSearchLoading = false
         if playlistAddMode {
             playlistAddMode = false
             isPlaylistSearchActive = true
+            if let search = playlistSearchField {
+                search.stringValue = ""
+            }
             applySearchCreateFieldState(animated: false)
             refreshPlaylistsSection()
             return
@@ -1152,6 +1162,238 @@ extension DynamicIslandPlayerView {
                 self?.showToastBanner(message: "✓ Exported \"\(playlist.name)\"")
             } catch {
                 self?.showToastBanner(message: "✕ Failed to export: \(error.localizedDescription)", isWarning: true)
+            }
+        }
+    }
+
+    // MARK: - Search Result Actions (Account & YouTube Music)
+
+    func playSearchAccountTrack(_ item: SearchAccountTrackItem) {
+        if let local = item.localTrack,
+           (NowPlayingManager.shared.engineMode == .offline || (item.videoId ?? "").isEmpty || !NetworkMonitor.shared.isReachable) {
+            NowPlayingManager.shared.playOfflineTrack(local, in: [local])
+            return
+        }
+        guard let vid = item.videoId, !vid.isEmpty else {
+            showToastBanner(message: "⚠️ Track unavailable offline", isWarning: true)
+            return
+        }
+        guard NetworkMonitor.shared.isReachable else {
+            showToastBanner(message: "⚡ Offline — internet required to stream", isWarning: true)
+            return
+        }
+        NowPlayingManager.shared.applyOptimisticTrackChange(
+            title: item.title,
+            artist: item.artist,
+            artworkUrl: item.artworkUrl,
+            videoId: vid
+        )
+        PlaylistManager.shared.playOnlineVideo(videoId: vid)
+    }
+
+    @objc func handlePlaySearchAccountTrack(_ sender: ReactiveIconButton) {
+        guard let item = sender.representedObject as? SearchAccountTrackItem else { return }
+        playSearchAccountTrack(item)
+    }
+
+    @objc func handleAddSearchAccountTrack(_ sender: ReactiveIconButton) {
+        guard let item = sender.representedObject as? SearchAccountTrackItem else { return }
+        if playlistAddMode, let targetPlaylist = playlistDetailMode {
+            let result = addSearchAccountTrack(item, to: targetPlaylist.id)
+            showToastBanner(message: result.message, isWarning: !result.success)
+            refreshPlaylistsSection()
+            updateSettingsThemeHighlight()
+            return
+        }
+
+        let playlists = PlaylistManager.shared.fetchPlaylists()
+        let menu = NSMenu(title: "Add to Playlist")
+        for pl in playlists {
+            let subItem = NSMenuItem(title: pl.name, action: #selector(handleSearchMenuAddAccountTrackToPlaylist(_:)), keyEquivalent: "")
+            subItem.target = self
+            subItem.representedObject = ["item": item, "playlistID": pl.id]
+            menu.addItem(subItem)
+        }
+        if !playlists.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+        let newPLItem = NSMenuItem(title: "+ New Playlist…", action: #selector(handleSearchMenuNewPlaylistWithAccountTrack(_:)), keyEquivalent: "")
+        newPLItem.target = self
+        newPLItem.representedObject = item
+        menu.addItem(newPLItem)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    private func addSearchAccountTrack(_ item: SearchAccountTrackItem, to playlistID: String) -> (success: Bool, message: String) {
+        if let local = item.localTrack {
+            return PlaylistManager.shared.appendTrack(to: playlistID, track: local)
+        }
+        let ytmTrack = YTMClient.Track(
+            videoId: item.videoId ?? "",
+            title: item.title,
+            artist: item.artist,
+            album: "",
+            artworkUrl: item.artworkUrl,
+            duration: ""
+        )
+        return PlaylistManager.shared.appendYouTubeTrack(to: playlistID, track: ytmTrack)
+    }
+
+    @objc func handleSearchMenuAddAccountTrackToPlaylist(_ sender: NSMenuItem) {
+        guard let dict = sender.representedObject as? [String: Any],
+              let item = dict["item"] as? SearchAccountTrackItem,
+              let playlistID = dict["playlistID"] as? String else { return }
+        let res = addSearchAccountTrack(item, to: playlistID)
+        let plName = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == playlistID })?.name ?? "Playlist"
+        showToastBanner(message: res.success ? "✓ Added to \(plName)" : res.message, isWarning: !res.success)
+        refreshPlaylistsSection()
+    }
+
+    @objc func handleSearchMenuNewPlaylistWithAccountTrack(_ sender: NSMenuItem) {
+        guard let item = sender.representedObject as? SearchAccountTrackItem else { return }
+        promptForDrawerPlaylistName(title: "New Playlist", defaultName: "\(item.title) Playlist") { [weak self] name in
+            guard let self = self else { return }
+            if let newID = PlaylistManager.shared.createPlaylist(name: name) {
+                _ = self.addSearchAccountTrack(item, to: newID)
+                self.showToastBanner(message: "✓ Created \"\(name)\"")
+                self.refreshPlaylistsSection()
+            }
+        }
+    }
+
+    func playSearchYTMTrack(_ track: YTMClient.Track) {
+        if let offline = LocalLibraryManager.shared.allTracks.first(where: { $0.ytVideoId == track.videoId && !$0.fileURL.path.isEmpty }),
+           (!NetworkMonitor.shared.isReachable || NowPlayingManager.shared.engineMode == .offline) {
+            NowPlayingManager.shared.playOfflineTrack(offline, in: [offline])
+            return
+        }
+        guard NetworkMonitor.shared.isReachable else {
+            showToastBanner(message: "⚡ Offline — internet required to play", isWarning: true)
+            return
+        }
+        NowPlayingManager.shared.applyOptimisticTrackChange(
+            title: track.title,
+            artist: track.artist,
+            album: track.album,
+            artworkUrl: track.artworkUrl,
+            videoId: track.videoId
+        )
+        PlaylistManager.shared.playOnlineVideo(videoId: track.videoId)
+    }
+
+    @objc func handlePlaySearchYTMTrack(_ sender: ReactiveIconButton) {
+        guard let track = sender.representedObject as? YTMClient.Track else { return }
+        playSearchYTMTrack(track)
+    }
+
+    @objc func handleAddSearchYTMTrack(_ sender: ReactiveIconButton) {
+        guard let track = sender.representedObject as? YTMClient.Track else { return }
+        if playlistAddMode, let targetPlaylist = playlistDetailMode {
+            let res = PlaylistManager.shared.appendYouTubeTrack(to: targetPlaylist.id, track: track)
+            showToastBanner(message: res.message, isWarning: !res.success)
+            refreshPlaylistsSection()
+            updateSettingsThemeHighlight()
+            return
+        }
+
+        let playlists = PlaylistManager.shared.fetchPlaylists()
+        let menu = NSMenu(title: "Add to Playlist")
+        for pl in playlists {
+            let subItem = NSMenuItem(title: pl.name, action: #selector(handleSearchMenuAddYTMTrackToPlaylist(_:)), keyEquivalent: "")
+            subItem.target = self
+            subItem.representedObject = ["track": track, "playlistID": pl.id]
+            menu.addItem(subItem)
+        }
+        if !playlists.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+        let newPLItem = NSMenuItem(title: "+ New Playlist…", action: #selector(handleSearchMenuNewPlaylistWithYTMTrack(_:)), keyEquivalent: "")
+        newPLItem.target = self
+        newPLItem.representedObject = track
+        menu.addItem(newPLItem)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc func handleSearchMenuAddYTMTrackToPlaylist(_ sender: NSMenuItem) {
+        guard let dict = sender.representedObject as? [String: Any],
+              let track = dict["track"] as? YTMClient.Track,
+              let playlistID = dict["playlistID"] as? String else { return }
+        let res = PlaylistManager.shared.appendYouTubeTrack(to: playlistID, track: track)
+        let plName = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == playlistID })?.name ?? "Playlist"
+        showToastBanner(message: res.success ? "✓ Added to \(plName)" : res.message, isWarning: !res.success)
+        refreshPlaylistsSection()
+    }
+
+    @objc func handleSearchMenuNewPlaylistWithYTMTrack(_ sender: NSMenuItem) {
+        guard let track = sender.representedObject as? YTMClient.Track else { return }
+        promptForDrawerPlaylistName(title: "New Playlist", defaultName: "\(track.title) Playlist") { [weak self] name in
+            guard let self = self else { return }
+            if let newID = PlaylistManager.shared.createPlaylist(name: name) {
+                PlaylistManager.shared.appendYouTubeTrack(to: newID, track: track)
+                self.showToastBanner(message: "✓ Created \"\(name)\"")
+                self.refreshPlaylistsSection()
+            }
+        }
+    }
+
+    @objc func handleImportSearchYTMPlaylist(_ sender: ReactiveIconButton) {
+        guard let pl = sender.representedObject as? YTMClient.SearchPlaylistResult else { return }
+        importAndOpenSearchYTMPlaylist(pl, openAfterImport: false)
+    }
+
+    func importAndOpenSearchYTMPlaylist(_ pl: YTMClient.SearchPlaylistResult, openAfterImport: Bool) {
+        if let existing = PlaylistManager.shared.fetchPlaylists().first(where: { $0.ytPlaylistId == pl.playlistId }) {
+            if openAfterImport {
+                playlistSearchDebounceWork?.cancel()
+                playlistSearchGeneration &+= 1
+                cachedYTMSearchQuery = ""
+                cachedYTMSearchResults = nil
+                isYTMSearchLoading = false
+                playlistDetailMode = existing
+                playlistAddMode = false
+                isPlaylistSearchActive = true
+                isPlaylistCreateOpen = false
+                playlistSearchField?.stringValue = ""
+                resetPlaylistSectionChrome()
+                applySearchCreateFieldState(animated: false)
+                refreshPlaylistsSection()
+                updateSettingsThemeHighlight()
+            } else {
+                showToastBanner(message: "\"\(existing.name)\" is already in Your Playlists")
+            }
+            return
+        }
+
+        guard NetworkMonitor.shared.isReachable else {
+            showToastBanner(message: "⚡ Offline — internet required to import playlist", isWarning: true)
+            return
+        }
+
+        showToastBanner(message: "Importing \"\(pl.title)\"…")
+        PlaylistManager.shared.importPlaylist(from: pl.playlistId) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                self.showToastBanner(message: "✕ \(error.localizedDescription)", isWarning: true)
+            case .success(let info):
+                self.showToastBanner(message: "✓ Imported \"\(info.title)\" (\(info.trackCount) tracks)")
+                if openAfterImport,
+                   let imported = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == info.playlistID }) {
+                    self.playlistSearchDebounceWork?.cancel()
+                    self.playlistSearchGeneration &+= 1
+                    self.cachedYTMSearchQuery = ""
+                    self.cachedYTMSearchResults = nil
+                    self.isYTMSearchLoading = false
+                    self.playlistDetailMode = imported
+                    self.playlistAddMode = false
+                    self.isPlaylistSearchActive = true
+                    self.isPlaylistCreateOpen = false
+                    self.playlistSearchField?.stringValue = ""
+                    self.resetPlaylistSectionChrome()
+                    self.applySearchCreateFieldState(animated: false)
+                }
+                self.refreshPlaylistsSection()
+                self.updateSettingsThemeHighlight()
             }
         }
     }

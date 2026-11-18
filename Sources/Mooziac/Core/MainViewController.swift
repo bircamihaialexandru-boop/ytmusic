@@ -517,6 +517,10 @@ class MainViewController: NSViewController, DynamicIslandPlayerViewDelegate, Hea
         onResetPosition?()
     }
 
+    func dynamicIslandDidTapPin() {
+        StatusItemManager.shared?.togglePinOnTop()
+    }
+
     func dynamicIslandDidTapPlaylistLibrary(playlistID: String?) {
         setPlaylistLibraryVisible(true)
         if let id = playlistID {

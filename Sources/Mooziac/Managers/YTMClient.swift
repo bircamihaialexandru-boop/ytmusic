@@ -370,6 +370,91 @@ public final class YTMClient {
         }
     }
 
+    /// Searches YouTube Music across the user's account library (when signed in) and general
+    /// YouTube Music catalog, returning deduplicated account-first and general results.
+    public func searchYouTubeMusic(query: String, completion: @escaping (Result<YouTubeMusicSearchResults, Error>) -> Void) {
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanQuery.isEmpty else {
+            completion(.success(YouTubeMusicSearchResults(
+                query: "",
+                accountTracks: [],
+                accountPlaylists: [],
+                generalTracks: [],
+                generalPlaylists: []
+            )))
+            return
+        }
+
+        let isSignedIn = LikedSongsManager.shared.isSignedIn || PlaylistSyncManager.shared.isSignedIn
+        let group = DispatchGroup()
+        let lock = NSLock()
+
+        var libraryResult: Result<(tracks: [Track], playlists: [SearchPlaylistResult]), Error>?
+        var generalResult: Result<(tracks: [Track], playlists: [SearchPlaylistResult]), Error>?
+
+        if isSignedIn {
+            group.enter()
+            let libraryPayload: [String: Any] = [
+                "query": cleanQuery,
+                "scope": "LIBRARY"
+            ]
+            post(endpoint: "search", payload: libraryPayload) { result in
+                lock.lock()
+                libraryResult = result.map { Self.parseSearchResults(from: $0) }
+                lock.unlock()
+                group.leave()
+            }
+        }
+
+        group.enter()
+        let generalPayload: [String: Any] = ["query": cleanQuery]
+        post(endpoint: "search", payload: generalPayload) { result in
+            lock.lock()
+            generalResult = result.map { Self.parseSearchResults(from: $0) }
+            lock.unlock()
+            group.leave()
+        }
+
+        group.notify(queue: DispatchQueue.global(qos: .userInitiated)) {
+            let parsedAccount = (try? libraryResult?.get()) ?? (tracks: [], playlists: [])
+            let parsedGeneral = try? generalResult?.get()
+
+            if parsedGeneral == nil, libraryResult == nil || (try? libraryResult?.get()) == nil {
+                if case .failure(let err) = generalResult {
+                    completion(.failure(err))
+                    return
+                }
+                completion(.failure(YTMError.badResponse))
+                return
+            }
+
+            let accountTrackIds = Set(parsedAccount.tracks.map(\.videoId))
+            let accountPlaylistIds = Set(parsedAccount.playlists.map(\.playlistId))
+
+            var seenGenTracks = Set<String>()
+            let generalTracks = (parsedGeneral?.tracks ?? []).filter { track in
+                guard !accountTrackIds.contains(track.videoId), !seenGenTracks.contains(track.videoId) else { return false }
+                seenGenTracks.insert(track.videoId)
+                return true
+            }
+
+            var seenGenPlaylists = Set<String>()
+            let generalPlaylists = (parsedGeneral?.playlists ?? []).filter { pl in
+                guard !accountPlaylistIds.contains(pl.playlistId), !seenGenPlaylists.contains(pl.playlistId) else { return false }
+                seenGenPlaylists.insert(pl.playlistId)
+                return true
+            }
+
+            completion(.success(YouTubeMusicSearchResults(
+                query: cleanQuery,
+                accountTracks: parsedAccount.tracks,
+                accountPlaylists: parsedAccount.playlists,
+                generalTracks: generalTracks,
+                generalPlaylists: generalPlaylists
+            )))
+        }
+    }
+
     /// Loops through `continuation` tokens until the response stops returning one
     /// (capped at a sane page count so a huge library can't spin forever).
     private func fetchAllBrowsePages(browseId: String, pageLimit: Int = 10,
@@ -388,9 +473,6 @@ public final class YTMClient {
                 case .failure(let error):
                     completion(.failure(error))
                 case .success(let json):
-                    if pages.isEmpty {
-                        Self.dumpDebugPage(json, browseId: browseId)
-                    }
                     pages.append(json)
                     let token = Self.continuationToken(in: json)
                     if let token = token, !token.isEmpty, pages.count < pageLimit {
@@ -463,22 +545,6 @@ public final class YTMClient {
     }
 
     // MARK: - Tolerant JSON extraction
-
-    /// Temporary debug aid: writes the first browse response for a given browseId
-    /// to a file in /tmp so response shape can be inspected while testing. Remove
-    /// once the sync is confirmed working.
-    private static func dumpDebugPage(_ json: [String: Any], browseId: String) {
-        do {
-            let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted])
-            guard let string = String(data: data, encoding: .utf8) else { return }
-            let safe = browseId.replacingOccurrences(of: "/", with: "_")
-            let url = URL(fileURLWithPath: "/tmp/ytm_\(safe).json")
-            try string.write(to: url, atomically: true, encoding: .utf8)
-            Log.web.debug("Dumped \(browseId) response to \(url.path)")
-        } catch {
-            Log.web.debug("Failed to dump debug page for \(browseId): \(error.localizedDescription)")
-        }
-    }
 
     /// DFS that collects every dictionary in a JSON tree.
     private static func collectDicts(_ value: Any?, into result: inout [[String: Any]]) {
@@ -812,6 +878,322 @@ public final class YTMClient {
         }
 
         return nil
+    }
+
+    /// Parses tracks and playlists from an InnerTube search response (supports tabbed, single-column, and sectionList layouts).
+    public static func parseSearchResults(from page: [String: Any]) -> (tracks: [Track], playlists: [SearchPlaylistResult]) {
+        let sections = extractSearchSections(from: page)
+        guard !sections.isEmpty else { return ([], []) }
+
+        var tracks: [Track] = []
+        var playlists: [SearchPlaylistResult] = []
+        var seenVideoIds = Set<String>()
+        var seenPlaylistIds = Set<String>()
+
+        func appendTrack(_ track: Track) {
+            guard !track.videoId.isEmpty, !track.title.isEmpty, !seenVideoIds.contains(track.videoId) else { return }
+            seenVideoIds.insert(track.videoId)
+            tracks.append(track)
+        }
+
+        func appendPlaylist(_ playlist: SearchPlaylistResult) {
+            guard !playlist.playlistId.isEmpty, !playlist.title.isEmpty, !seenPlaylistIds.contains(playlist.playlistId) else { return }
+            seenPlaylistIds.insert(playlist.playlistId)
+            playlists.append(playlist)
+        }
+
+        // 1. Check Top Card shelves (musicCardShelfRenderer)
+        for s in sections {
+            guard let card = s["musicCardShelfRenderer"] as? [String: Any] else { continue }
+            let title = textFrom(card["title"])
+            let subtitle = textFrom(card["subtitle"])
+            let isPodcast = subtitle.contains("Episode") || subtitle.contains("Podcast")
+
+            if let playlist = extractPlaylistResult(from: card, fallbackTitle: title, fallbackSubtitle: subtitle) {
+                appendPlaylist(playlist)
+            } else if !isPodcast {
+                let cardThumb = extractThumbnailUrl(from: card)
+                if let onTap = card["onTap"] as? [String: Any],
+                   let watch = onTap["watchEndpoint"] as? [String: Any],
+                   let vid = watch["videoId"] as? String, !vid.isEmpty, !title.isEmpty {
+                    let meta = parseFlexMetadata(subtitle)
+                    let resolvedThumb = cardThumb.isEmpty ? "https://i.ytimg.com/vi/\(vid)/hqdefault.jpg" : cardThumb
+                    appendTrack(Track(
+                        videoId: vid,
+                        title: title,
+                        artist: meta.artist.isEmpty ? subtitle : meta.artist,
+                        album: meta.album,
+                        artworkUrl: resolvedThumb,
+                        duration: meta.duration
+                    ))
+                } else if let buttons = card["buttons"] as? [[String: Any]] {
+                    for b in buttons {
+                        guard let rend = b["buttonRenderer"] as? [String: Any] else { continue }
+                        let nav = (rend["navigationEndpoint"] as? [String: Any]) ?? (rend["command"] as? [String: Any])
+                        if let watch = nav?["watchEndpoint"] as? [String: Any],
+                           let vid = watch["videoId"] as? String, !vid.isEmpty, !title.isEmpty {
+                            let plist = watch["playlistId"] as? String ?? ""
+                            if !plist.hasPrefix("RD") {
+                                let meta = parseFlexMetadata(subtitle)
+                                let resolvedThumb = cardThumb.isEmpty ? "https://i.ytimg.com/vi/\(vid)/hqdefault.jpg" : cardThumb
+                                appendTrack(Track(
+                                    videoId: vid,
+                                    title: title,
+                                    artist: meta.artist.isEmpty ? subtitle : meta.artist,
+                                    album: meta.album,
+                                    artworkUrl: resolvedThumb,
+                                    duration: meta.duration
+                                ))
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let cardContents = card["contents"] as? [[String: Any]] {
+                for item in cardContents {
+                    guard let r = item["musicResponsiveListItemRenderer"] as? [String: Any] else { continue }
+                    if let playlist = extractPlaylistResult(from: r) {
+                        appendPlaylist(playlist)
+                    } else if let vid = extractVideoId(from: r) {
+                        let itemTitle = listItemTitle(r)
+                        let meta = parseRendererMetadata(r, fallbackSubtitle: subtitle)
+                        let art = extractThumbnailUrl(from: r, videoId: vid)
+                        appendTrack(Track(
+                            videoId: vid,
+                            title: itemTitle.isEmpty ? title : itemTitle,
+                            artist: meta.artist,
+                            album: meta.album,
+                            artworkUrl: art,
+                            duration: meta.duration
+                        ))
+                    }
+                }
+            }
+        }
+
+        // 2. Check general shelves (musicShelfRenderer or itemSectionRenderer)
+        for s in sections {
+            var candidateRenderers: [[String: Any]] = []
+            if let shelf = s["musicShelfRenderer"] as? [String: Any],
+               let items = shelf["contents"] as? [[String: Any]] {
+                for item in items {
+                    if let r = item["musicResponsiveListItemRenderer"] as? [String: Any] {
+                        candidateRenderers.append(r)
+                    }
+                }
+            } else if let isr = s["itemSectionRenderer"] as? [String: Any],
+                      let items = isr["contents"] as? [[String: Any]] {
+                for item in items {
+                    if let r = item["musicResponsiveListItemRenderer"] as? [String: Any] {
+                        candidateRenderers.append(r)
+                    } else if let subShelf = item["musicShelfRenderer"] as? [String: Any],
+                              let subItems = subShelf["contents"] as? [[String: Any]] {
+                        for subItem in subItems {
+                            if let r = subItem["musicResponsiveListItemRenderer"] as? [String: Any] {
+                                candidateRenderers.append(r)
+                            }
+                        }
+                    }
+                }
+            }
+
+            for r in candidateRenderers {
+                if let playlist = extractPlaylistResult(from: r) {
+                    appendPlaylist(playlist)
+                    continue
+                }
+                guard let vid = extractVideoId(from: r) else { continue }
+                let title = listItemTitle(r)
+                guard !title.isEmpty else { continue }
+                let meta = parseRendererMetadata(r)
+                if meta.isPodcast { continue }
+                let art = extractThumbnailUrl(from: r, videoId: vid)
+                appendTrack(Track(
+                    videoId: vid,
+                    title: title,
+                    artist: meta.artist,
+                    album: meta.album,
+                    artworkUrl: art,
+                    duration: meta.duration
+                ))
+            }
+        }
+
+        return (tracks, playlists)
+    }
+
+    private static func extractSearchSections(from page: [String: Any]) -> [[String: Any]] {
+        if let contents = page["contents"] as? [String: Any] {
+            if let tabbed = contents["tabbedSearchResultsRenderer"] as? [String: Any],
+               let tabs = tabbed["tabs"] as? [[String: Any]],
+               let firstTab = tabs.first,
+               let tabRenderer = firstTab["tabRenderer"] as? [String: Any],
+               let tabContent = tabRenderer["content"] as? [String: Any],
+               let sectionList = tabContent["sectionListRenderer"] as? [String: Any],
+               let sections = sectionList["contents"] as? [[String: Any]] {
+                return sections
+            }
+            if let single = contents["singleColumnBrowseResultsRenderer"] as? [String: Any],
+               let tabs = single["tabs"] as? [[String: Any]],
+               let firstTab = tabs.first,
+               let tabRenderer = firstTab["tabRenderer"] as? [String: Any],
+               let tabContent = tabRenderer["content"] as? [String: Any],
+               let sectionList = tabContent["sectionListRenderer"] as? [String: Any],
+               let sections = sectionList["contents"] as? [[String: Any]] {
+                return sections
+            }
+            if let sectionList = contents["sectionListRenderer"] as? [String: Any],
+               let sections = sectionList["contents"] as? [[String: Any]] {
+                return sections
+            }
+        }
+        if let continuation = page["continuationContents"] as? [String: Any],
+           let sectionCont = continuation["sectionListContinuation"] as? [String: Any],
+           let sections = sectionCont["contents"] as? [[String: Any]] {
+            return sections
+        }
+        return []
+    }
+
+    private static func extractThumbnailUrl(from dict: [String: Any], videoId: String? = nil) -> String {
+        if let thumb = dict["thumbnail"] as? [String: Any] {
+            if let renderer = thumb["musicThumbnailRenderer"] as? [String: Any],
+               let inner = renderer["thumbnail"] as? [String: Any],
+               let thumbs = inner["thumbnails"] as? [[String: Any]],
+               let url = thumbs.last?["url"] as? String, !url.isEmpty {
+                return url
+            }
+            if let thumbs = thumb["thumbnails"] as? [[String: Any]],
+               let url = thumbs.last?["url"] as? String, !url.isEmpty {
+                return url
+            }
+        }
+        if let vid = videoId, !vid.isEmpty {
+            return "https://i.ytimg.com/vi/\(vid)/hqdefault.jpg"
+        }
+        return ""
+    }
+
+    private static func extractPlaylistResult(from dict: [String: Any],
+                                              fallbackTitle: String? = nil,
+                                              fallbackSubtitle: String? = nil) -> SearchPlaylistResult? {
+        let nav = (dict["navigationEndpoint"] as? [String: Any]) ?? (dict["onTap"] as? [String: Any])
+        guard let browse = nav?["browseEndpoint"] as? [String: Any],
+              let browseId = browse["browseId"] as? String, !browseId.isEmpty else {
+            return nil
+        }
+
+        let configs = browse["browseEndpointContextSupportedConfigs"] as? [String: Any]
+        let musicConfig = configs?["browseEndpointContextMusicConfig"] as? [String: Any]
+        let pageType = musicConfig?["pageType"] as? String
+
+        guard browseId.hasPrefix("VL") || browseId.hasPrefix("PL") || pageType == "MUSIC_PAGE_TYPE_PLAYLIST" else {
+            return nil
+        }
+
+        let cleanId = browseId.hasPrefix("VL") ? String(browseId.dropFirst(2)) : browseId
+        guard !cleanId.isEmpty else { return nil }
+        let normalizedBrowseId = browseId.hasPrefix("VL") ? browseId : "VL\(cleanId)"
+
+        let title = listItemTitle(dict).isEmpty ? (fallbackTitle ?? "") : listItemTitle(dict)
+        guard !title.isEmpty else { return nil }
+
+        var subtitle = fallbackSubtitle ?? ""
+        if subtitle.isEmpty,
+           let flexColumns = dict["flexColumns"] as? [[String: Any]], flexColumns.count >= 2,
+           let col = flexColumns[1]["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any] {
+            subtitle = textFrom(col["text"])
+        }
+
+        let parts = subtitle
+            .components(separatedBy: " • ")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0.lowercased() != "playlist" }
+
+        var author = ""
+        var trackCountText = ""
+        for part in parts {
+            let lower = part.lowercased()
+            if lower.contains("song") || lower.contains("track") || lower.contains("video") {
+                if trackCountText.isEmpty { trackCountText = part }
+            } else if author.isEmpty {
+                author = part
+            } else if trackCountText.isEmpty {
+                trackCountText = part
+            }
+        }
+
+        let artworkUrl = extractThumbnailUrl(from: dict)
+        return SearchPlaylistResult(
+            playlistId: cleanId,
+            browseId: normalizedBrowseId,
+            title: title,
+            author: author,
+            artworkUrl: artworkUrl,
+            trackCountText: trackCountText
+        )
+    }
+
+    private static func parseRendererMetadata(_ dict: [String: Any], fallbackSubtitle: String = "") -> (artist: String, album: String, duration: String, isPodcast: Bool) {
+        var rawLine = fallbackSubtitle
+        if let flexColumns = dict["flexColumns"] as? [[String: Any]], flexColumns.count >= 2,
+           let col = flexColumns[1]["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any] {
+            let text = textFrom(col["text"])
+            if !text.isEmpty {
+                rawLine = text
+            }
+        }
+
+        var meta = parseFlexMetadata(rawLine)
+        if meta.duration.isEmpty,
+           let flexColumns = dict["flexColumns"] as? [[String: Any]], flexColumns.count >= 3,
+           let col = flexColumns[2]["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any] {
+            let d = textFrom(col["text"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if Self.looksLikeDuration(d) {
+                meta.duration = d
+            }
+        }
+        if meta.duration.isEmpty {
+            let len = textFrom(dict["lengthText"]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !len.isEmpty {
+                meta.duration = len
+            }
+        }
+        return meta
+    }
+
+    private static func parseFlexMetadata(_ subtitle: String) -> (artist: String, album: String, duration: String, isPodcast: Bool) {
+        let lowerFull = subtitle.lowercased()
+        let isPodcast = lowerFull.contains("episode") || lowerFull.contains("podcast")
+        var parts = subtitle
+            .components(separatedBy: " • ")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let kindPrefixes: Set<String> = ["song", "video", "single", "ep", "album"]
+        if let first = parts.first, kindPrefixes.contains(first.lowercased()) {
+            parts.removeFirst()
+        }
+
+        var duration = ""
+        if let last = parts.last, looksLikeDuration(last) {
+            duration = last
+            parts.removeLast()
+        }
+
+        let artist = parts.first ?? ""
+        let album = parts.count > 1 ? parts.dropFirst().joined(separator: " • ") : ""
+        return (artist, album, duration, isPodcast)
+    }
+
+    private static func looksLikeDuration(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.contains(":") else { return false }
+        let segments = trimmed.split(separator: ":")
+        guard segments.count == 2 || segments.count == 3 else { return false }
+        return segments.allSatisfy { !$0.isEmpty && $0.allSatisfy(\.isNumber) }
     }
 
     private static func extractVideoId(from dict: [String: Any]) -> String? {

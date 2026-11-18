@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build & Test (macOS)
+    name: Build, Test & Package Universal (macOS Intel + Apple Silicon)
     runs-on: macos-14
     steps:
       - name: Checkout repository
@@ -39,8 +39,22 @@ jobs:
           swift --version
           uname -m
 
-      - name: Build Mooziac (Release)
-        run: swift build -c release --product Mooziac
-
       - name: Run Unit Tests
         run: swift test --parallel
+
+      - name: Build Universal Release Bundle (arm64 + x86_64)
+        run: ./build_app.sh --release-only --require-universal
+
+      - name: Verify Universal Binary Architectures
+        run: |
+          lipo -info dist/staging/Mooziac.app/Contents/MacOS/Mooziac
+          lipo -verify_arch arm64 x86_64 dist/staging/Mooziac.app/Contents/MacOS/Mooziac
+
+      - name: Upload macOS Universal Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mooziac-macOS-Universal
+          path: |
+            dist/Mooziac.dmg
+            dist/Mooziac.zip
+          if-no-files-found: error

@@ -15,6 +15,7 @@ protocol DynamicIslandPlayerViewDelegate: AnyObject {
     func dynamicIslandDidTapOfflineLibrary()
     func dynamicIslandDidTapPlaylistLibrary(playlistID: String?)
     func dynamicIslandDidToggleExpanded(expanded: Bool)
+    func dynamicIslandDidTapPin()
 }
 
 class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditingDelegate {
@@ -34,6 +35,7 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
     let repeatButton = ReactiveIconButton()
     let likeButton = ReactiveIconButton()
     let searchIconButton = ReactiveIconButton()
+    let pinButton = ReactiveIconButton()
     let downloadButton = CircularProgressDownloadButton()
     let browserButton = ReactiveIconButton()
     let fullScreenButton = ReactiveIconButton()
@@ -137,6 +139,11 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
     var playlistRowHeight: CGFloat = 40
     var playlistWindowBuffer: CGFloat = 1.0
     var playlistIsReordering = false
+    var playlistSearchDebounceWork: DispatchWorkItem?
+    var playlistSearchGeneration: UInt64 = 0
+    var cachedYTMSearchQuery: String = ""
+    var cachedYTMSearchResults: YTMClient.YouTubeMusicSearchResults?
+    var isYTMSearchLoading: Bool = false
     let inlineCreateContainer = NSView()
     let inlineCreateTextField = NSTextField()
     var playlistSearchField: GlassSearchField?
@@ -279,6 +286,7 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
             likeButton.image = image
         }
         updateLikeButtonColor()
+        updatePinButtonState(isPinned: UserDefaults.standard.bool(forKey: "YTM_isPlayerPinnedOnTop"))
     }
     
     func updateLikeButtonColor() {
@@ -447,6 +455,7 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
         downloadButton.action = #selector(downloadCurrentTrackTapped)
         downloadButton.toolTip = "Download Song"
 
+        setupIconButton(pinButton, systemName: "pin", toolTip: "Pin Player on Top", action: #selector(pinTapped), pointSize: 12.5)
         setupIconButton(fullScreenButton, systemName: "macwindow.on.rectangle", toolTip: "Open Full Web Browser View", action: #selector(fullScreenTapped), pointSize: 13.5)
         setupIconButton(browserButton, systemName: "ellipsis.circle.fill", toolTip: "Player Settings & Options", action: #selector(browserTapped), pointSize: 14.8)
         setupIconButton(resetPositionButton, systemName: "arrow.uturn.backward", toolTip: "Snap Player Back to Menu Bar", action: #selector(resetPositionTapped), pointSize: 13.5)
@@ -459,6 +468,7 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
         repeatButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
         likeButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
         searchIconButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
+        pinButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
         fullScreenButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
         browserButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
         resetPositionButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
@@ -469,7 +479,7 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
         controlsStack.alignment = .centerY
         controlsStack.translatesAutoresizingMaskIntoConstraints = false
         
-        [addToPlaylistButton, repeatButton, previousButton, playPauseButton, nextButton, likeButton, searchIconButton, downloadButton, fullScreenButton, browserButton].forEach { btn in
+        [addToPlaylistButton, repeatButton, previousButton, playPauseButton, nextButton, likeButton, searchIconButton, pinButton, downloadButton, fullScreenButton, browserButton].forEach { btn in
             btn.setContentCompressionResistancePriority(.required, for: .horizontal)
             btn.setContentHuggingPriority(.required, for: .horizontal)
         }
@@ -494,9 +504,9 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
             hqBadgeLabel.heightAnchor.constraint(equalToConstant: 16)
         ])
         
-        let topRightStack = NSStackView(views: [hqBadgeLabel, downloadButton, fullScreenButton, browserButton])
+        let topRightStack = NSStackView(views: [hqBadgeLabel, pinButton, downloadButton, fullScreenButton, browserButton])
         topRightStack.orientation = .horizontal
-        topRightStack.spacing = 6
+        topRightStack.spacing = 5
         topRightStack.alignment = .centerY
         topRightStack.translatesAutoresizingMaskIntoConstraints = false
         topRightStack.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -1280,6 +1290,32 @@ class DynamicIslandPlayerView: NSView, NSSearchFieldDelegate, NSControlTextEditi
             case .darkMode:
                 addToPlaylistButton.contentTintColor = NSColor(white: 0.85, alpha: 1.0)
             }
+        }
+    }
+
+    @objc func pinTapped() {
+        pinButton.animatePop()
+        delegate?.dynamicIslandDidTapPin()
+    }
+
+    public func updatePinButtonState(isPinned: Bool) {
+        self.isPinned = isPinned
+        let iconName = isPinned ? "pin.fill" : "pin"
+        let config = NSImage.SymbolConfiguration(pointSize: 12.5, weight: .semibold)
+        if let image = NSImage(systemSymbolName: iconName, accessibilityDescription: isPinned ? "Unpin Player" : "Pin Player on Top")?.withSymbolConfiguration(config) {
+            pinButton.image = image
+        }
+        pinButton.toolTip = isPinned ? "Unpin Player (Currently On Top)" : "Pin Player on Top"
+        updatePinButtonColor()
+    }
+
+    func updatePinButtonColor() {
+        if isPinned {
+            let isLight = (PlayerDesign.current == .glassMode || (PlayerDesign.current == .liquidFluid && !SystemAppearanceHelper.isDarkSystemAppearance))
+            let isDark = (PlayerDesign.current == .darkMode)
+            pinButton.contentTintColor = isLight ? NSColor.lightThemeSelector : (isDark ? NSColor.darkThemeSelector : NSColor(red: 0.0, green: 0.85, blue: 1.0, alpha: 1.0))
+        } else {
+            pinButton.contentTintColor = SystemAppearanceHelper.controlButtonTint(for: PlayerDesign.current)
         }
     }
 

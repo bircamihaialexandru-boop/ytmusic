@@ -915,4 +915,40 @@ class LikedSongRowView: NSView {
     }
 }
 
+final class InteractiveSearchCardView: NSView {
+    var onClick: (() -> Void)?
+    private var isPressedInside = false
+
+    override func mouseDown(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        isPressedInside = bounds.contains(pt)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        let shouldFire = isPressedInside && bounds.contains(pt)
+        isPressedInside = false
+        if shouldFire {
+            onClick?()
+        }
+    }
+}
+
+final class SearchAccountTrackItem {
+    let title: String
+    let artist: String
+    let sourceLabel: String
+    let videoId: String?
+    let artworkUrl: String
+    let localTrack: LocalTrack?
+
+    init(title: String, artist: String, sourceLabel: String, videoId: String?, artworkUrl: String, localTrack: LocalTrack?) {
+        self.title = title
+        self.artist = artist
+        self.sourceLabel = sourceLabel
+        self.videoId = videoId
+        self.artworkUrl = artworkUrl
+        self.localTrack = localTrack
+    }
+}
 

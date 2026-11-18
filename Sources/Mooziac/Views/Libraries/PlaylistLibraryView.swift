@@ -28,6 +28,15 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
         case history
     }
 
+    enum PlaylistSearchItem {
+        case sectionHeader(String)
+        case localPlaylist(PlaylistRecord)
+        case accountTrack(SearchAccountTrackItem)
+        case ytmPlaylist(YTMClient.SearchPlaylistResult, badge: String)
+        case ytmTrack(YTMClient.Track)
+        case status(String)
+    }
+
     private let topBar = NSView()
     private let backButton = ReactiveIconButton()
     private let librarySegmentedControl = NSSegmentedControl(labels: ["Playlists", "Liked Songs", "Downloads", "History"], trackingMode: .selectOne, target: nil, action: nil)
@@ -66,6 +75,7 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
 
     var mode: Mode = .list {
         didSet {
+            resetYTMSearchState()
             currentSearchQuery = ""
             searchField.stringValue = ""
             reload()
@@ -74,6 +84,20 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
 
     var allPlaylists: [PlaylistRecord] = []
     var filteredPlaylists: [PlaylistRecord] = []
+    var playlistSearchItems: [PlaylistSearchItem] = []
+
+    var ytmSearchDebounceWork: DispatchWorkItem?
+    var ytmSearchGeneration: UInt64 = 0
+    var cachedYTMSearchQuery: String = ""
+    var cachedYTMSearchResults: YTMClient.YouTubeMusicSearchResults?
+    var isYTMSearchLoading: Bool = false
+
+    var isPlaylistListSearchActive: Bool {
+        if case .list = mode {
+            return !currentSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return false
+    }
 
     var allLikedSongs: [LikedSongRecord] = []
     var filteredLikedSongs: [LikedSongRecord] = []
@@ -410,7 +434,7 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
         case .list:
             allPlaylists = PlaylistManager.shared.fetchPlaylists()
             applyFilter()
-            emptyStateView.isHidden = !filteredPlaylists.isEmpty
+            emptyStateView.isHidden = isPlaylistListSearchActive ? !playlistSearchItems.isEmpty : !filteredPlaylists.isEmpty
             tableView.reloadData()
         case .detail(let pl):
             if let updated = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == pl.id }) {
@@ -745,7 +769,7 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
             emptyStateIcon.image = NSImage(systemSymbolName: "music.note.list", accessibilityDescription: "Empty")
             emptyStateLabel.stringValue = "No playlists yet"
             emptyStateSubLabel.stringValue = "Create a playlist below or import an M3U8 or JSON playlist file"
-            emptyStateView.isHidden = !filteredPlaylists.isEmpty
+            emptyStateView.isHidden = isPlaylistListSearchActive ? !playlistSearchItems.isEmpty : !filteredPlaylists.isEmpty
 
         case .detail(let playlist):
             allPlaylistItems = PlaylistManager.shared.fetchPlaylistItems(playlistID: playlist.id)
@@ -898,14 +922,25 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
         scrollView.contentView.scroll(to: .zero)
     }
 
+    func resetYTMSearchState() {
+        ytmSearchDebounceWork?.cancel()
+        ytmSearchGeneration &+= 1
+        cachedYTMSearchQuery = ""
+        cachedYTMSearchResults = nil
+        isYTMSearchLoading = false
+        playlistSearchItems = []
+    }
+
     func applyFilter() {
-        let query = currentSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanQuery = currentSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = cleanQuery.lowercased()
         switch mode {
         case .list:
             if query.isEmpty {
                 filteredPlaylists = allPlaylists
+                playlistSearchItems = []
             } else {
-                filteredPlaylists = allPlaylists.filter { $0.name.lowercased().contains(query) }
+                rebuildPlaylistSearchItems(cleanQuery: cleanQuery, lowerQuery: query)
             }
         case .detail:
             if query.isEmpty {
@@ -940,6 +975,169 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
                 }
             }
         }
+    }
+
+    private func rebuildPlaylistSearchItems(cleanQuery: String, lowerQuery: String) {
+        if URLFilter.containsLink(cleanQuery) {
+            filteredPlaylists = []
+            playlistSearchItems = [.status("⚠️ Links aren't supported in search — use Import Playlist instead")]
+            return
+        }
+
+        let remoteResults: YTMClient.YouTubeMusicSearchResults? =
+            (cachedYTMSearchQuery.caseInsensitiveCompare(cleanQuery) == .orderedSame) ? cachedYTMSearchResults : nil
+
+        var matchedPlaylists: [PlaylistRecord] = []
+        var accountPlaylistYTMIds = Set<String>()
+        var accountVideoIds = Set<String>()
+        var accountTrackKeys = Set<String>()
+        var accountTracks: [SearchAccountTrackItem] = []
+
+        let allLocalTracks = LocalLibraryManager.shared.allTracks
+
+        for pl in allPlaylists {
+            if let ytmId = pl.ytPlaylistId, !ytmId.isEmpty {
+                accountPlaylistYTMIds.insert(ytmId)
+            }
+            let items = PlaylistManager.shared.fetchPlaylistItems(playlistID: pl.id)
+            let nameMatches = pl.name.lowercased().contains(lowerQuery)
+            let itemMatches = items.filter {
+                $0.title.lowercased().contains(lowerQuery) || $0.artist.lowercased().contains(lowerQuery)
+            }
+            if nameMatches || !itemMatches.isEmpty {
+                matchedPlaylists.append(pl)
+            }
+            for item in itemMatches where accountTracks.count < 14 {
+                let vid = item.ytVideoId ?? (item.refType == "yt" ? item.refID : nil)
+                let key = "\(item.title.lowercased())|\(item.artist.lowercased())"
+                if let v = vid, !v.isEmpty {
+                    if accountVideoIds.contains(v) { continue }
+                    accountVideoIds.insert(v)
+                } else if accountTrackKeys.contains(key) {
+                    continue
+                }
+                accountTrackKeys.insert(key)
+                let localMatch = allLocalTracks.first(where: {
+                    if item.refType == "local" && ($0.fileURL.path == item.refID || $0.id == item.refID) { return true }
+                    if let v = vid, !v.isEmpty, $0.ytVideoId == v { return true }
+                    return false
+                })
+                accountTracks.append(SearchAccountTrackItem(
+                    title: item.title,
+                    artist: item.artist,
+                    sourceLabel: "In \(pl.name)",
+                    videoId: vid,
+                    artworkUrl: item.artworkUrl,
+                    localTrack: localMatch
+                ))
+            }
+        }
+
+        for liked in LikedSongsManager.shared.fetchLikedSongs() where accountTracks.count < 16 {
+            let matches = liked.title.lowercased().contains(lowerQuery) || liked.artist.lowercased().contains(lowerQuery)
+            guard matches else { continue }
+            let key = "\(liked.title.lowercased())|\(liked.artist.lowercased())"
+            if !liked.videoId.isEmpty {
+                if accountVideoIds.contains(liked.videoId) { continue }
+                accountVideoIds.insert(liked.videoId)
+            } else if accountTrackKeys.contains(key) {
+                continue
+            }
+            accountTrackKeys.insert(key)
+            let localMatch = allLocalTracks.first(where: {
+                (!liked.videoId.isEmpty && $0.ytVideoId == liked.videoId) || $0.fileURL.path == liked.videoId
+            })
+            accountTracks.append(SearchAccountTrackItem(
+                title: liked.title,
+                artist: liked.artist,
+                sourceLabel: "Liked Songs",
+                videoId: liked.videoId.isEmpty ? nil : liked.videoId,
+                artworkUrl: liked.artworkUrl,
+                localTrack: localMatch
+            ))
+        }
+
+        for local in allLocalTracks where accountTracks.count < 16 {
+            let matches = local.title.lowercased().contains(lowerQuery) || local.artist.lowercased().contains(lowerQuery)
+            guard matches else { continue }
+            let key = "\(local.title.lowercased())|\(local.artist.lowercased())"
+            if let v = local.ytVideoId, !v.isEmpty {
+                if accountVideoIds.contains(v) { continue }
+                accountVideoIds.insert(v)
+            } else if accountTrackKeys.contains(key) {
+                continue
+            }
+            accountTrackKeys.insert(key)
+            accountTracks.append(SearchAccountTrackItem(
+                title: local.title,
+                artist: local.artist,
+                sourceLabel: "Downloaded",
+                videoId: local.ytVideoId,
+                artworkUrl: local.artworkURL?.path ?? "",
+                localTrack: local
+            ))
+        }
+
+        var remoteAccountPlaylists: [YTMClient.SearchPlaylistResult] = []
+        if let remote = remoteResults {
+            for pl in remote.accountPlaylists where !accountPlaylistYTMIds.contains(pl.playlistId) && remoteAccountPlaylists.count < 6 {
+                accountPlaylistYTMIds.insert(pl.playlistId)
+                remoteAccountPlaylists.append(pl)
+            }
+            for track in remote.accountTracks where accountTracks.count < 18 {
+                if accountVideoIds.contains(track.videoId) { continue }
+                accountVideoIds.insert(track.videoId)
+                accountTracks.append(SearchAccountTrackItem(
+                    title: track.title,
+                    artist: track.artist,
+                    sourceLabel: "Your Account",
+                    videoId: track.videoId,
+                    artworkUrl: track.artworkUrl,
+                    localTrack: allLocalTracks.first(where: { $0.ytVideoId == track.videoId })
+                ))
+            }
+        }
+
+        filteredPlaylists = matchedPlaylists
+
+        var items: [PlaylistSearchItem] = [.sectionHeader("FROM YOUR ACCOUNT")]
+        if matchedPlaylists.isEmpty && remoteAccountPlaylists.isEmpty && accountTracks.isEmpty {
+            items.append(.status("No matching playlists or songs in your account"))
+        } else {
+            for pl in matchedPlaylists.prefix(8) {
+                items.append(.localPlaylist(pl))
+            }
+            for pl in remoteAccountPlaylists {
+                items.append(.ytmPlaylist(pl, badge: "Account Playlist"))
+            }
+            for track in accountTracks {
+                items.append(.accountTrack(track))
+            }
+        }
+
+        items.append(.sectionHeader("YOUTUBE MUSIC"))
+        if !NetworkMonitor.shared.isReachable {
+            items.append(.status("⚡ Offline — connect to the internet for YouTube Music results"))
+        } else if isYTMSearchLoading && remoteResults == nil {
+            items.append(.status("Searching YouTube Music…"))
+        } else if let remote = remoteResults {
+            let generalPlaylists = remote.generalPlaylists.filter { !accountPlaylistYTMIds.contains($0.playlistId) }
+            let generalTracks = remote.generalTracks.filter { !accountVideoIds.contains($0.videoId) }
+            if generalPlaylists.isEmpty && generalTracks.isEmpty {
+                items.append(.status("No additional YouTube Music results found"))
+            } else {
+                for pl in generalPlaylists.prefix(6) {
+                    items.append(.ytmPlaylist(pl, badge: "YTM Playlist"))
+                }
+                for track in generalTracks.prefix(15) {
+                    items.append(.ytmTrack(track))
+                }
+            }
+        } else {
+            items.append(.status("No additional YouTube Music results found"))
+        }
+
+        playlistSearchItems = items
     }
 
     // MARK: - Actions
@@ -1190,12 +1388,32 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
         confirmAndDeletePlaylist(playlist)
     }
 
+    private func activateSearchItem(at row: Int) {
+        guard row >= 0, row < playlistSearchItems.count else { return }
+        switch playlistSearchItems[row] {
+        case .localPlaylist(let playlist):
+            mode = .detail(playlist)
+        case .accountTrack(let item):
+            playSearchAccountTrack(item)
+        case .ytmPlaylist(let pl, _):
+            importAndOpenSearchYTMPlaylist(pl, openAfterImport: true)
+        case .ytmTrack(let track):
+            playSearchYTMTrack(track)
+        case .sectionHeader, .status:
+            break
+        }
+    }
+
     @objc private func handleDoubleAction() {
         let row = tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow
         guard row >= 0 else { return }
 
         switch mode {
         case .list:
+            if isPlaylistListSearchActive {
+                activateSearchItem(at: row)
+                return
+            }
             guard row < filteredPlaylists.count else { return }
             let playlist = filteredPlaylists[row]
             mode = .detail(playlist)
@@ -1221,6 +1439,10 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
 
         switch mode {
         case .list:
+            if isPlaylistListSearchActive {
+                activateSearchItem(at: row)
+                return
+            }
             guard row < filteredPlaylists.count else { return }
             let playlist = filteredPlaylists[row]
             mode = .detail(playlist)
@@ -1246,6 +1468,13 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
 
         switch mode {
         case .list:
+            if isPlaylistListSearchActive {
+                guard row < playlistSearchItems.count else { return }
+                if case .localPlaylist(let playlist) = playlistSearchItems[row] {
+                    confirmAndDeletePlaylist(playlist)
+                }
+                return
+            }
             guard row < filteredPlaylists.count else { return }
             let playlist = filteredPlaylists[row]
             confirmAndDeletePlaylist(playlist)
@@ -1332,5 +1561,198 @@ public class PlaylistLibraryView: NSView, NSTableViewDelegate, NSTableViewDataSo
         let tracks = filteredDownloads.isEmpty ? allDownloads : filteredDownloads
         PlaylistManager.shared.startDownloadsPlayback(tracks: tracks, startingAt: track.id, shuffle: false)
         CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "Playing \"\(track.title)\"")
+    }
+
+    // MARK: - YouTube Music Search Result Actions
+
+    func playSearchAccountTrack(_ item: SearchAccountTrackItem) {
+        if let local = item.localTrack,
+           (NowPlayingManager.shared.engineMode == .offline || (item.videoId ?? "").isEmpty || !NetworkMonitor.shared.isReachable) {
+            NowPlayingManager.shared.playOfflineTrack(local, in: [local])
+            CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "Playing \"\(item.title)\"")
+            return
+        }
+        guard let vid = item.videoId, !vid.isEmpty else {
+            CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "⚠️ Track unavailable offline")
+            return
+        }
+        guard NetworkMonitor.shared.isReachable else {
+            CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "⚡ Offline — internet required to stream")
+            return
+        }
+        NowPlayingManager.shared.applyOptimisticTrackChange(
+            title: item.title,
+            artist: item.artist,
+            artworkUrl: item.artworkUrl,
+            videoId: vid
+        )
+        PlaylistManager.shared.playOnlineVideo(videoId: vid)
+    }
+
+    func playSearchYTMTrack(_ track: YTMClient.Track) {
+        if let offline = LocalLibraryManager.shared.allTracks.first(where: { $0.ytVideoId == track.videoId && !$0.fileURL.path.isEmpty }),
+           (!NetworkMonitor.shared.isReachable || NowPlayingManager.shared.engineMode == .offline) {
+            NowPlayingManager.shared.playOfflineTrack(offline, in: [offline])
+            CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "Playing \"\(track.title)\"")
+            return
+        }
+        guard NetworkMonitor.shared.isReachable else {
+            CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "⚡ Offline — internet required to play")
+            return
+        }
+        NowPlayingManager.shared.applyOptimisticTrackChange(
+            title: track.title,
+            artist: track.artist,
+            album: track.album,
+            artworkUrl: track.artworkUrl,
+            videoId: track.videoId
+        )
+        PlaylistManager.shared.playOnlineVideo(videoId: track.videoId)
+    }
+
+    func addSearchAccountTrack(_ item: SearchAccountTrackItem, to playlistID: String) -> (success: Bool, message: String) {
+        if let local = item.localTrack {
+            return PlaylistManager.shared.appendTrack(to: playlistID, track: local)
+        }
+        let ytmTrack = YTMClient.Track(
+            videoId: item.videoId ?? "",
+            title: item.title,
+            artist: item.artist,
+            album: "",
+            artworkUrl: item.artworkUrl,
+            duration: ""
+        )
+        return PlaylistManager.shared.appendYouTubeTrack(to: playlistID, track: ytmTrack)
+    }
+
+    func showAddSearchAccountTrackMenu(_ item: SearchAccountTrackItem, from sender: NSButton) {
+        let playlists = PlaylistManager.shared.fetchPlaylists()
+        let menu = NSMenu(title: "Add to Playlist")
+        for pl in playlists {
+            let subItem = NSMenuItem(title: pl.name, action: #selector(handleLibraryAddSearchAccountTrackToPlaylist(_:)), keyEquivalent: "")
+            subItem.target = self
+            subItem.representedObject = ["item": item, "playlistID": pl.id]
+            menu.addItem(subItem)
+        }
+        if !playlists.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+        let newPLItem = NSMenuItem(title: "+ New Playlist…", action: #selector(handleLibraryNewPlaylistWithSearchAccountTrack(_:)), keyEquivalent: "")
+        newPLItem.target = self
+        newPLItem.representedObject = item
+        menu.addItem(newPLItem)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    func showAddSearchYTMTrackMenu(_ track: YTMClient.Track, from sender: NSButton) {
+        let playlists = PlaylistManager.shared.fetchPlaylists()
+        let menu = NSMenu(title: "Add to Playlist")
+        for pl in playlists {
+            let subItem = NSMenuItem(title: pl.name, action: #selector(handleLibraryAddSearchYTMTrackToPlaylist(_:)), keyEquivalent: "")
+            subItem.target = self
+            subItem.representedObject = ["track": track, "playlistID": pl.id]
+            menu.addItem(subItem)
+        }
+        if !playlists.isEmpty {
+            menu.addItem(NSMenuItem.separator())
+        }
+        let newPLItem = NSMenuItem(title: "+ New Playlist…", action: #selector(handleLibraryNewPlaylistWithSearchYTMTrack(_:)), keyEquivalent: "")
+        newPLItem.target = self
+        newPLItem.representedObject = track
+        menu.addItem(newPLItem)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    func importAndOpenSearchYTMPlaylist(_ pl: YTMClient.SearchPlaylistResult, openAfterImport: Bool) {
+        if let existing = PlaylistManager.shared.fetchPlaylists().first(where: { $0.ytPlaylistId == pl.playlistId }) {
+            if openAfterImport {
+                mode = .detail(existing)
+            } else {
+                CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "\"\(existing.name)\" is already in Your Playlists")
+            }
+            return
+        }
+        guard NetworkMonitor.shared.isReachable else {
+            CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "⚡ Offline — internet required to import playlist")
+            return
+        }
+        CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "Importing \"\(pl.title)\"…")
+        PlaylistManager.shared.importPlaylist(from: pl.playlistId) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "✕ \(error.localizedDescription)")
+            case .success(let info):
+                CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "✓ Imported \"\(info.title)\" (\(info.trackCount) tracks)")
+                if openAfterImport,
+                   let imported = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == info.playlistID }) {
+                    self.mode = .detail(imported)
+                } else {
+                    self.reload()
+                }
+            }
+        }
+    }
+
+    @objc func handleLibraryAddSearchAccountTrackToPlaylist(_ sender: NSMenuItem) {
+        guard let dict = sender.representedObject as? [String: Any],
+              let item = dict["item"] as? SearchAccountTrackItem,
+              let playlistID = dict["playlistID"] as? String else { return }
+        let res = addSearchAccountTrack(item, to: playlistID)
+        let plName = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == playlistID })?.name ?? "Playlist"
+        CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: res.success ? "✓ Added to \(plName)" : res.message)
+    }
+
+    @objc func handleLibraryNewPlaylistWithSearchAccountTrack(_ sender: NSMenuItem) {
+        guard let item = sender.representedObject as? SearchAccountTrackItem else { return }
+        promptForName(title: "New Playlist", defaultName: "\(item.title) Playlist", actionTitle: "Create") { [weak self] name in
+            guard let self = self else { return }
+            if let newID = PlaylistManager.shared.createPlaylist(name: name) {
+                _ = self.addSearchAccountTrack(item, to: newID)
+                CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "✓ Created \"\(name)\"")
+                self.reload()
+            }
+        }
+    }
+
+    @objc func handleLibraryAddSearchYTMTrackToPlaylist(_ sender: NSMenuItem) {
+        guard let dict = sender.representedObject as? [String: Any],
+              let track = dict["track"] as? YTMClient.Track,
+              let playlistID = dict["playlistID"] as? String else { return }
+        let res = PlaylistManager.shared.appendYouTubeTrack(to: playlistID, track: track)
+        let plName = PlaylistManager.shared.fetchPlaylists().first(where: { $0.id == playlistID })?.name ?? "Playlist"
+        CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: res.success ? "✓ Added to \(plName)" : res.message)
+    }
+
+    @objc func handleLibraryNewPlaylistWithSearchYTMTrack(_ sender: NSMenuItem) {
+        guard let track = sender.representedObject as? YTMClient.Track else { return }
+        promptForName(title: "New Playlist", defaultName: "\(track.title) Playlist", actionTitle: "Create") { [weak self] name in
+            guard let self = self else { return }
+            if let newID = PlaylistManager.shared.createPlaylist(name: name) {
+                PlaylistManager.shared.appendYouTubeTrack(to: newID, track: track)
+                CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "✓ Created \"\(name)\"")
+                self.reload()
+            }
+        }
+    }
+
+    @objc func handleLibraryPlaySearchAccountTrackItem(_ sender: NSMenuItem) {
+        guard let item = sender.representedObject as? SearchAccountTrackItem else { return }
+        playSearchAccountTrack(item)
+    }
+
+    @objc func handleLibraryPlaySearchYTMTrackItem(_ sender: NSMenuItem) {
+        guard let track = sender.representedObject as? YTMClient.Track else { return }
+        playSearchYTMTrack(track)
+    }
+
+    @objc func handleLibraryImportSearchYTMPlaylistItem(_ sender: NSMenuItem) {
+        guard let pl = sender.representedObject as? YTMClient.SearchPlaylistResult else { return }
+        importAndOpenSearchYTMPlaylist(pl, openAfterImport: false)
+    }
+
+    @objc func handleLibraryImportAndOpenSearchYTMPlaylistItem(_ sender: NSMenuItem) {
+        guard let pl = sender.representedObject as? YTMClient.SearchPlaylistResult else { return }
+        importAndOpenSearchYTMPlaylist(pl, openAfterImport: true)
     }
 }

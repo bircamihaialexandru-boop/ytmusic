@@ -441,6 +441,34 @@ public final class PlaylistManager: NSObject {
         return (true, "Added \"\(record.title)\" to playlist")
     }
 
+    @discardableResult
+    public func appendYouTubeTrack(to playlistID: String, track: YTMClient.Track) -> (success: Bool, message: String) {
+        let existing = LocalDatabaseManager.shared.fetchPlaylistItems(playlistID: playlistID)
+        if existing.contains(where: {
+            (!track.videoId.isEmpty && ($0.refID == track.videoId || $0.ytVideoId == track.videoId)) ||
+            (!track.title.isEmpty && $0.title.lowercased() == track.title.lowercased() && $0.artist.lowercased() == track.artist.lowercased())
+        }) {
+            return (false, "Already in playlist")
+        }
+
+        let item = PlaylistItemRecord(
+            playlistID: playlistID,
+            sortOrder: existing.count,
+            refType: "yt",
+            refID: track.videoId,
+            ytVideoId: track.videoId.isEmpty ? nil : track.videoId,
+            title: track.title,
+            artist: track.artist,
+            artworkUrl: track.artworkUrl,
+            duration: track.duration,
+            isLiked: false
+        )
+        LocalDatabaseManager.shared.appendPlaylistItem(item)
+        markSyncedDirtyIfNeeded(playlistID: playlistID)
+        invalidateSummary(for: playlistID)
+        return (true, "Added \"\(track.title)\" to playlist")
+    }
+
     // MARK: - Capture Current Online Queue into a Playlist
 
     public func createPlaylistFromCurrentQueue(name: String, completion: @escaping (String?, Int) -> Void) {

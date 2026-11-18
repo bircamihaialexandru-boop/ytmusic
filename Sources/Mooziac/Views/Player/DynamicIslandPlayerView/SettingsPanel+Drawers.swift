@@ -6,6 +6,11 @@ extension DynamicIslandPlayerView {
     private func selectLibraryTab(_ tab: LibraryTab) {
         guard tab != activeLibraryTab else { return }
         activeLibraryTab = tab
+        playlistSearchDebounceWork?.cancel()
+        playlistSearchGeneration &+= 1
+        cachedYTMSearchQuery = ""
+        cachedYTMSearchResults = nil
+        isYTMSearchLoading = false
         isPlaylistSearchActive = true
         isPlaylistCreateOpen = false
         isPlaylistSelectionMode = false
@@ -237,8 +242,68 @@ extension DynamicIslandPlayerView {
         }
     }
 
+    func resetPlaylistSearchState() {
+        playlistSearchDebounceWork?.cancel()
+        playlistSearchGeneration &+= 1
+        cachedYTMSearchQuery = ""
+        cachedYTMSearchResults = nil
+        isYTMSearchLoading = false
+    }
+
     @objc func handlePlaylistSearchChanged(_ sender: NSSearchField) {
-        refreshPlaylistsSection(filterQuery: sender.stringValue)
+        let query = sender.stringValue
+        playlistSearchDebounceWork?.cancel()
+        playlistSearchGeneration &+= 1
+        let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if clean.isEmpty {
+            cachedYTMSearchQuery = ""
+            cachedYTMSearchResults = nil
+            isYTMSearchLoading = false
+            refreshPlaylistsSection(filterQuery: "")
+            return
+        }
+
+        if URLFilter.containsLink(clean) {
+            isYTMSearchLoading = false
+            refreshPlaylistsSection(filterQuery: clean)
+            return
+        }
+
+        let shouldSearchYTM = (playlistDetailMode == nil && activeLibraryTab == .playlists) || playlistAddMode
+        if shouldSearchYTM {
+            let hasFreshCache = (clean.caseInsensitiveCompare(cachedYTMSearchQuery) == .orderedSame && cachedYTMSearchResults != nil)
+            if !hasFreshCache {
+                cachedYTMSearchResults = nil
+                isYTMSearchLoading = NetworkMonitor.shared.isReachable
+            }
+            refreshPlaylistsSection(filterQuery: clean)
+
+            if NetworkMonitor.shared.isReachable && !hasFreshCache {
+                let generation = playlistSearchGeneration
+                let work = DispatchWorkItem { [weak self] in
+                    YTMClient.shared.searchYouTubeMusic(query: clean) { result in
+                        DispatchQueue.main.async {
+                            guard let self = self, self.playlistSearchGeneration == generation else { return }
+                            self.isYTMSearchLoading = false
+                            self.cachedYTMSearchQuery = clean
+                            if case .success(let searchResults) = result {
+                                self.cachedYTMSearchResults = searchResults
+                            }
+                            let current = self.playlistSearchField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            if current.caseInsensitiveCompare(clean) == .orderedSame {
+                                self.refreshPlaylistsSection(filterQuery: current)
+                                self.updateSettingsThemeHighlight()
+                            }
+                        }
+                    }
+                }
+                playlistSearchDebounceWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.32, execute: work)
+            }
+        } else {
+            refreshPlaylistsSection(filterQuery: query)
+        }
     }
 
     func updatePlaylistSearchToggleIcon() {
@@ -259,6 +324,7 @@ extension DynamicIslandPlayerView {
                 isPlaylistSelectionMode = false
                 selectedPlaylistIDs.removeAll()
             }
+            resetPlaylistSearchState()
             playlistSearchField?.stringValue = ""
             resetPlaylistSectionChrome()
             refreshPlaylistsSection()
@@ -266,6 +332,7 @@ extension DynamicIslandPlayerView {
             expandSearchField(animated: true)
             window?.makeFirstResponder(playlistSearchField)
         } else {
+            resetPlaylistSearchState()
             playlistSearchField?.stringValue = ""
             window?.makeFirstResponder(nil)
             collapseSearchField(animated: true)
@@ -282,6 +349,7 @@ extension DynamicIslandPlayerView {
         }
         if isPlaylistSearchActive {
             isPlaylistSearchActive = false
+            resetPlaylistSearchState()
             playlistSearchField?.stringValue = ""
             window?.makeFirstResponder(nil)
             collapseSearchField(animated: true)
@@ -311,6 +379,7 @@ extension DynamicIslandPlayerView {
             isPlaylistSelectionMode = true
             if isPlaylistSearchActive {
                 isPlaylistSearchActive = false
+                resetPlaylistSearchState()
                 playlistSearchField?.stringValue = ""
                 window?.makeFirstResponder(nil)
                 collapseSearchField(animated: true)
@@ -360,7 +429,7 @@ extension DynamicIslandPlayerView {
         }
     }
 
-    public func refreshPlaylistsSection(filterQuery: String = "") {
+    public func refreshPlaylistsSection(filterQuery: String? = nil) {
         playlistBuildToken += 1
         pendingRowBuilders = []
         pendingRowItemIDs = []
@@ -371,14 +440,16 @@ extension DynamicIslandPlayerView {
         playlistsStackView.subviews.forEach { $0.removeFromSuperview() }
         detailStackView.subviews.forEach { $0.removeFromSuperview() }
 
+        let effectiveQuery = filterQuery ?? (playlistSearchField?.stringValue ?? "")
         let tone = currentSettingsTone()
 
         if let playlist = playlistDetailMode {
-            renderPlaylistDetail(playlist, tone: tone, filterQuery: filterQuery)
+            renderPlaylistDetail(playlist, tone: tone, filterQuery: effectiveQuery)
             return
         }
 
-        let trimmedQuery = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanQuery = effectiveQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedQuery = cleanQuery.lowercased()
 
         librarySectionHeaderLabel.isHidden = false
         switch activeLibraryTab {
@@ -398,12 +469,13 @@ extension DynamicIslandPlayerView {
 
         switch activeLibraryTab {
         case .playlists:
-            var playlists = PlaylistManager.shared.fetchPlaylists()
+            let playlists = PlaylistManager.shared.fetchPlaylists()
             if !trimmedQuery.isEmpty {
-                playlists = playlists.filter { $0.name.lowercased().contains(trimmedQuery) }
+                renderSectionedPlaylistSearch(query: cleanQuery, lowerQuery: trimmedQuery, playlists: playlists, tone: tone)
+                return
             }
             if playlists.isEmpty {
-                emptyText = trimmedQuery.isEmpty ? "No playlists yet. Click '+ Create Playlist' below to make one." : "No matching playlists found"
+                emptyText = "No playlists yet. Click '+ Create Playlist' below to make one."
             } else {
                 itemIDs = playlists.map { $0.id }
                 builders = playlists.map { playlist in
@@ -476,6 +548,603 @@ extension DynamicIslandPlayerView {
             return
         }
         scheduleIncrementalBuild(builders, itemIDs: itemIDs, into: playlistsStackView)
+    }
+
+    private func renderSectionedPlaylistSearch(query: String, lowerQuery: String, playlists: [PlaylistRecord], tone: SettingsTone) {
+        if URLFilter.containsLink(query) {
+            mountSectionedViews(
+                [(makeSearchStatusView("⚠️ Links aren't supported in search — use Import Playlist instead", tone: tone), 28)],
+                into: playlistsStackView
+            )
+            return
+        }
+
+        var rows: [(view: NSView, height: CGFloat)] = []
+        let remoteResults: YTMClient.YouTubeMusicSearchResults? =
+            (cachedYTMSearchQuery.caseInsensitiveCompare(query) == .orderedSame) ? cachedYTMSearchResults : nil
+
+        // 1. Account Section: Local/Synced Playlists + Account Songs + InnerTube LIBRARY results
+        var matchedPlaylists: [PlaylistRecord] = []
+        var accountPlaylistYTMIds = Set<String>()
+        var accountVideoIds = Set<String>()
+        var accountTrackKeys = Set<String>()
+        var accountTracks: [SearchAccountTrackItem] = []
+
+        let allLocalTracks = LocalLibraryManager.shared.allTracks
+
+        for pl in playlists {
+            if let ytmId = pl.ytPlaylistId, !ytmId.isEmpty {
+                accountPlaylistYTMIds.insert(ytmId)
+            }
+            let items = PlaylistManager.shared.fetchPlaylistItems(playlistID: pl.id)
+            let nameMatches = pl.name.lowercased().contains(lowerQuery)
+            let itemMatches = items.filter {
+                $0.title.lowercased().contains(lowerQuery) || $0.artist.lowercased().contains(lowerQuery)
+            }
+            if nameMatches || !itemMatches.isEmpty {
+                matchedPlaylists.append(pl)
+            }
+            for item in itemMatches where accountTracks.count < 14 {
+                let vid = item.ytVideoId ?? (item.refType == "yt" ? item.refID : nil)
+                let key = "\(item.title.lowercased())|\(item.artist.lowercased())"
+                if let v = vid, !v.isEmpty {
+                    if accountVideoIds.contains(v) { continue }
+                    accountVideoIds.insert(v)
+                } else if accountTrackKeys.contains(key) {
+                    continue
+                }
+                accountTrackKeys.insert(key)
+                let localMatch = allLocalTracks.first(where: {
+                    if item.refType == "local" && ($0.fileURL.path == item.refID || $0.id == item.refID) { return true }
+                    if let v = vid, !v.isEmpty, $0.ytVideoId == v { return true }
+                    return false
+                })
+                accountTracks.append(SearchAccountTrackItem(
+                    title: item.title,
+                    artist: item.artist,
+                    sourceLabel: "In \(pl.name)",
+                    videoId: vid,
+                    artworkUrl: item.artworkUrl,
+                    localTrack: localMatch
+                ))
+            }
+        }
+
+        for liked in LikedSongsManager.shared.fetchLikedSongs() where accountTracks.count < 16 {
+            let matches = liked.title.lowercased().contains(lowerQuery) || liked.artist.lowercased().contains(lowerQuery)
+            guard matches else { continue }
+            let key = "\(liked.title.lowercased())|\(liked.artist.lowercased())"
+            if !liked.videoId.isEmpty {
+                if accountVideoIds.contains(liked.videoId) { continue }
+                accountVideoIds.insert(liked.videoId)
+            } else if accountTrackKeys.contains(key) {
+                continue
+            }
+            accountTrackKeys.insert(key)
+            let localMatch = allLocalTracks.first(where: {
+                (!liked.videoId.isEmpty && $0.ytVideoId == liked.videoId) || $0.fileURL.path == liked.videoId
+            })
+            accountTracks.append(SearchAccountTrackItem(
+                title: liked.title,
+                artist: liked.artist,
+                sourceLabel: "Liked Songs",
+                videoId: liked.videoId.isEmpty ? nil : liked.videoId,
+                artworkUrl: liked.artworkUrl,
+                localTrack: localMatch
+            ))
+        }
+
+        for local in allLocalTracks where accountTracks.count < 16 {
+            let matches = local.title.lowercased().contains(lowerQuery) || local.artist.lowercased().contains(lowerQuery)
+            guard matches else { continue }
+            let key = "\(local.title.lowercased())|\(local.artist.lowercased())"
+            if let v = local.ytVideoId, !v.isEmpty {
+                if accountVideoIds.contains(v) { continue }
+                accountVideoIds.insert(v)
+            } else if accountTrackKeys.contains(key) {
+                continue
+            }
+            accountTrackKeys.insert(key)
+            accountTracks.append(SearchAccountTrackItem(
+                title: local.title,
+                artist: local.artist,
+                sourceLabel: "Downloaded",
+                videoId: local.ytVideoId,
+                artworkUrl: local.artworkURL?.path ?? "",
+                localTrack: local
+            ))
+        }
+
+        var remoteAccountPlaylists: [YTMClient.SearchPlaylistResult] = []
+        if let remote = remoteResults {
+            for pl in remote.accountPlaylists where !accountPlaylistYTMIds.contains(pl.playlistId) && remoteAccountPlaylists.count < 6 {
+                accountPlaylistYTMIds.insert(pl.playlistId)
+                remoteAccountPlaylists.append(pl)
+            }
+            for track in remote.accountTracks where accountTracks.count < 18 {
+                if accountVideoIds.contains(track.videoId) { continue }
+                accountVideoIds.insert(track.videoId)
+                accountTracks.append(SearchAccountTrackItem(
+                    title: track.title,
+                    artist: track.artist,
+                    sourceLabel: "Your Account",
+                    videoId: track.videoId,
+                    artworkUrl: track.artworkUrl,
+                    localTrack: allLocalTracks.first(where: { $0.ytVideoId == track.videoId })
+                ))
+            }
+        }
+
+        rows.append((makeSearchSectionHeaderView("FROM YOUR ACCOUNT", tone: tone), 18))
+        if matchedPlaylists.isEmpty && remoteAccountPlaylists.isEmpty && accountTracks.isEmpty {
+            rows.append((makeSearchStatusView("No matching playlists or songs in your account", tone: tone), 24))
+        } else {
+            for pl in matchedPlaylists.prefix(8) {
+                rows.append((makePlaylistRow(playlist: pl, tone: tone), 44))
+            }
+            for pl in remoteAccountPlaylists {
+                rows.append((makeSearchYTMPlaylistRow(playlist: pl, badgeText: "Account Playlist", tone: tone), 44))
+            }
+            for item in accountTracks {
+                rows.append((makeSearchAccountTrackRow(item: item, tone: tone), 40))
+            }
+        }
+
+        // 2. General YouTube Music Section
+        rows.append((makeSearchSectionHeaderView("YOUTUBE MUSIC", tone: tone), 20))
+        if !NetworkMonitor.shared.isReachable {
+            rows.append((makeSearchStatusView("⚡ Offline — connect to the internet for YouTube Music results", tone: tone), 24))
+        } else if isYTMSearchLoading && remoteResults == nil {
+            rows.append((makeSearchStatusView("Searching YouTube Music…", tone: tone), 24))
+        } else if let remote = remoteResults {
+            let generalPlaylists = remote.generalPlaylists.filter { !accountPlaylistYTMIds.contains($0.playlistId) }
+            let generalTracks = remote.generalTracks.filter { !accountVideoIds.contains($0.videoId) }
+            if generalPlaylists.isEmpty && generalTracks.isEmpty {
+                rows.append((makeSearchStatusView("No additional YouTube Music results found", tone: tone), 24))
+            } else {
+                for pl in generalPlaylists.prefix(6) {
+                    rows.append((makeSearchYTMPlaylistRow(playlist: pl, badgeText: "YTM Playlist", tone: tone), 44))
+                }
+                for track in generalTracks.prefix(15) {
+                    rows.append((makeSearchYTMTrackRow(track: track, tone: tone), 40))
+                }
+            }
+        } else {
+            rows.append((makeSearchStatusView("No additional YouTube Music results found", tone: tone), 24))
+        }
+
+        mountSectionedViews(rows, into: playlistsStackView)
+    }
+
+    private func renderSectionedAddSongsSearch(query: String, lowerQuery: String, tone: SettingsTone) {
+        if URLFilter.containsLink(query) {
+            mountSectionedViews(
+                [(makeSearchStatusView("⚠️ Links aren't supported in search", tone: tone), 28)],
+                into: detailStackView
+            )
+            return
+        }
+
+        var rows: [(view: NSView, height: CGFloat)] = []
+        let remoteResults: YTMClient.YouTubeMusicSearchResults? =
+            (cachedYTMSearchQuery.caseInsensitiveCompare(query) == .orderedSame) ? cachedYTMSearchResults : nil
+
+        var accountVideoIds = Set<String>()
+        var accountTrackKeys = Set<String>()
+        var accountTracks: [SearchAccountTrackItem] = []
+        let allLocalTracks = LocalLibraryManager.shared.allTracks
+
+        for local in allLocalTracks where accountTracks.count < 14 {
+            let matches = local.title.lowercased().contains(lowerQuery) || local.artist.lowercased().contains(lowerQuery)
+            guard matches else { continue }
+            let key = "\(local.title.lowercased())|\(local.artist.lowercased())"
+            if let v = local.ytVideoId, !v.isEmpty {
+                if accountVideoIds.contains(v) { continue }
+                accountVideoIds.insert(v)
+            } else if accountTrackKeys.contains(key) {
+                continue
+            }
+            accountTrackKeys.insert(key)
+            accountTracks.append(SearchAccountTrackItem(
+                title: local.title,
+                artist: local.artist,
+                sourceLabel: "Downloaded",
+                videoId: local.ytVideoId,
+                artworkUrl: local.artworkURL?.path ?? "",
+                localTrack: local
+            ))
+        }
+
+        for liked in LikedSongsManager.shared.fetchLikedSongs() where accountTracks.count < 16 {
+            let matches = liked.title.lowercased().contains(lowerQuery) || liked.artist.lowercased().contains(lowerQuery)
+            guard matches else { continue }
+            let key = "\(liked.title.lowercased())|\(liked.artist.lowercased())"
+            if !liked.videoId.isEmpty {
+                if accountVideoIds.contains(liked.videoId) { continue }
+                accountVideoIds.insert(liked.videoId)
+            } else if accountTrackKeys.contains(key) {
+                continue
+            }
+            accountTrackKeys.insert(key)
+            let localMatch = allLocalTracks.first(where: {
+                (!liked.videoId.isEmpty && $0.ytVideoId == liked.videoId) || $0.fileURL.path == liked.videoId
+            })
+            accountTracks.append(SearchAccountTrackItem(
+                title: liked.title,
+                artist: liked.artist,
+                sourceLabel: "Liked Songs",
+                videoId: liked.videoId.isEmpty ? nil : liked.videoId,
+                artworkUrl: liked.artworkUrl,
+                localTrack: localMatch
+            ))
+        }
+
+        if let remote = remoteResults {
+            for track in remote.accountTracks where accountTracks.count < 18 {
+                if accountVideoIds.contains(track.videoId) { continue }
+                accountVideoIds.insert(track.videoId)
+                accountTracks.append(SearchAccountTrackItem(
+                    title: track.title,
+                    artist: track.artist,
+                    sourceLabel: "Your Account",
+                    videoId: track.videoId,
+                    artworkUrl: track.artworkUrl,
+                    localTrack: allLocalTracks.first(where: { $0.ytVideoId == track.videoId })
+                ))
+            }
+        }
+
+        rows.append((makeSearchSectionHeaderView("FROM YOUR ACCOUNT", tone: tone), 18))
+        if accountTracks.isEmpty {
+            rows.append((makeSearchStatusView("No matching songs in your account", tone: tone), 24))
+        } else {
+            for item in accountTracks {
+                rows.append((makeSearchAccountTrackRow(item: item, tone: tone), 40))
+            }
+        }
+
+        rows.append((makeSearchSectionHeaderView("YOUTUBE MUSIC", tone: tone), 20))
+        if !NetworkMonitor.shared.isReachable {
+            rows.append((makeSearchStatusView("⚡ Offline — connect to the internet for YouTube Music results", tone: tone), 24))
+        } else if isYTMSearchLoading && remoteResults == nil {
+            rows.append((makeSearchStatusView("Searching YouTube Music…", tone: tone), 24))
+        } else if let remote = remoteResults {
+            let generalTracks = remote.generalTracks.filter { !accountVideoIds.contains($0.videoId) }
+            if generalTracks.isEmpty {
+                rows.append((makeSearchStatusView("No additional YouTube Music songs found", tone: tone), 24))
+            } else {
+                for track in generalTracks.prefix(16) {
+                    rows.append((makeSearchYTMTrackRow(track: track, tone: tone), 40))
+                }
+            }
+        } else {
+            rows.append((makeSearchStatusView("No additional YouTube Music songs found", tone: tone), 24))
+        }
+
+        mountSectionedViews(rows, into: detailStackView)
+    }
+
+    private func mountSectionedViews(_ items: [(view: NSView, height: CGFloat)], into stack: NSStackView) {
+        stack.subviews.forEach { $0.removeFromSuperview() }
+        playlistActiveStackTopConstraint = (stack === playlistsStackView) ? playlistsStackTopConstraint : detailStackTopConstraint
+        playlistActiveStackTopConstraint?.constant = 0
+
+        var totalHeight: CGFloat = 16
+        for (index, entry) in items.enumerated() {
+            let view = entry.view
+            view.translatesAutoresizingMaskIntoConstraints = false
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            totalHeight += entry.height
+            if index > 0 {
+                totalHeight += stack.spacing
+            }
+        }
+        setPlaylistDocViewHeight(max(totalHeight + 24, 60))
+        playlistScrollView?.contentView.scroll(to: .zero)
+    }
+
+    private func makeSearchSectionHeaderView(_ title: String, tone: SettingsTone) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithString: title)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
+        label.textColor = tone.secondaryText.withAlphaComponent(0.85)
+        label.isEditable = false
+        label.isSelectable = false
+        label.refusesFirstResponder = true
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(equalToConstant: 18),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 4),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -4),
+            label.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -1)
+        ])
+        return container
+    }
+
+    private func makeSearchStatusView(_ text: String, tone: SettingsTone) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: 10.5, weight: .regular)
+        label.textColor = tone.secondaryText
+        label.isEditable = false
+        label.isSelectable = false
+        label.refusesFirstResponder = true
+        container.addSubview(label)
+        NSLayoutConstraint.activate([
+            container.heightAnchor.constraint(equalToConstant: 24),
+            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: container.centerYAnchor)
+        ])
+        return container
+    }
+
+    private func makeSearchAccountTrackRow(item: SearchAccountTrackItem, tone: SettingsTone) -> NSView {
+        let isLiquidDark = (PlayerDesign.current == .liquidFluid && SystemAppearanceHelper.isDarkSystemAppearance)
+        let row = InteractiveSearchCardView()
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 14
+        row.layer?.borderWidth = 1.0
+        row.layer?.borderColor = (isLiquidDark ? NSColor(white: 1.0, alpha: 0.20) : tone.dividerColor).cgColor
+        row.layer?.backgroundColor = (isLiquidDark ? NSColor(white: 1.0, alpha: 0.16) : (tone == .light ? NSColor(white: 0.0, alpha: 0.04) : NSColor(white: 1.0, alpha: 0.06))).cgColor
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.onClick = { [weak self] in
+            self?.playSearchAccountTrack(item)
+        }
+
+        let playBtn = ReactiveIconButton()
+        playBtn.translatesAutoresizingMaskIntoConstraints = false
+        playBtn.isBordered = false
+        playBtn.representedObject = item
+        let playConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+        playBtn.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")?.withSymbolConfiguration(playConfig)
+        playBtn.contentTintColor = rowPlayIconColor(tone: tone)
+        playBtn.toolTip = "Play"
+        playBtn.target = self
+        playBtn.action = #selector(handlePlaySearchAccountTrack(_:))
+        playBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        playBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+        let titleLbl = NSTextField(labelWithString: item.title)
+        titleLbl.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        titleLbl.textColor = tone.primaryText
+        titleLbl.maximumNumberOfLines = 1
+        titleLbl.usesSingleLineMode = true
+        titleLbl.lineBreakMode = .byTruncatingTail
+        titleLbl.isEditable = false
+        titleLbl.isSelectable = false
+        titleLbl.refusesFirstResponder = true
+
+        let artistPart = item.artist.isEmpty ? "YouTube Music" : item.artist
+        let metaLbl = NSTextField(labelWithString: "\(artistPart) • \(item.sourceLabel)")
+        metaLbl.font = NSFont.systemFont(ofSize: 9.5, weight: .regular)
+        metaLbl.textColor = tone.secondaryText
+        metaLbl.maximumNumberOfLines = 1
+        metaLbl.usesSingleLineMode = true
+        metaLbl.lineBreakMode = .byTruncatingTail
+        metaLbl.isEditable = false
+        metaLbl.isSelectable = false
+        metaLbl.refusesFirstResponder = true
+
+        let textCol = NSStackView(views: [titleLbl, metaLbl])
+        textCol.orientation = .vertical
+        textCol.alignment = .leading
+        textCol.spacing = 0
+        textCol.translatesAutoresizingMaskIntoConstraints = false
+
+        let addBtn = ReactiveIconButton()
+        addBtn.translatesAutoresizingMaskIntoConstraints = false
+        addBtn.isBordered = false
+        addBtn.representedObject = item
+        let addConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .bold)
+        addBtn.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add to Playlist")?.withSymbolConfiguration(addConfig)
+        addBtn.contentTintColor = rowPlayIconColor(tone: tone)
+        addBtn.toolTip = playlistAddMode ? "Add to \"\(playlistDetailMode?.name ?? "playlist")\"" : "Add to Playlist"
+        addBtn.target = self
+        addBtn.action = #selector(handleAddSearchAccountTrack(_:))
+        addBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        addBtn.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        row.addSubview(playBtn)
+        row.addSubview(textCol)
+        row.addSubview(addBtn)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 40),
+            playBtn.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            playBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            textCol.leadingAnchor.constraint(equalTo: playBtn.trailingAnchor, constant: 8),
+            textCol.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            textCol.trailingAnchor.constraint(lessThanOrEqualTo: addBtn.leadingAnchor, constant: -6),
+            addBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+            addBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+        return row
+    }
+
+    private func makeSearchYTMTrackRow(track: YTMClient.Track, tone: SettingsTone) -> NSView {
+        let isLiquidDark = (PlayerDesign.current == .liquidFluid && SystemAppearanceHelper.isDarkSystemAppearance)
+        let row = InteractiveSearchCardView()
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 14
+        row.layer?.borderWidth = 1.0
+        row.layer?.borderColor = (isLiquidDark ? NSColor(white: 1.0, alpha: 0.20) : tone.dividerColor).cgColor
+        row.layer?.backgroundColor = (isLiquidDark ? NSColor(white: 1.0, alpha: 0.16) : (tone == .light ? NSColor(white: 0.0, alpha: 0.04) : NSColor(white: 1.0, alpha: 0.06))).cgColor
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.onClick = { [weak self] in
+            self?.playSearchYTMTrack(track)
+        }
+
+        let playBtn = ReactiveIconButton()
+        playBtn.translatesAutoresizingMaskIntoConstraints = false
+        playBtn.isBordered = false
+        playBtn.representedObject = track
+        let playConfig = NSImage.SymbolConfiguration(pointSize: 10, weight: .bold)
+        playBtn.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")?.withSymbolConfiguration(playConfig)
+        playBtn.contentTintColor = rowPlayIconColor(tone: tone)
+        playBtn.toolTip = "Play on YouTube Music"
+        playBtn.target = self
+        playBtn.action = #selector(handlePlaySearchYTMTrack(_:))
+        playBtn.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        playBtn.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+        let titleLbl = NSTextField(labelWithString: track.title)
+        titleLbl.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        titleLbl.textColor = tone.primaryText
+        titleLbl.maximumNumberOfLines = 1
+        titleLbl.usesSingleLineMode = true
+        titleLbl.lineBreakMode = .byTruncatingTail
+        titleLbl.isEditable = false
+        titleLbl.isSelectable = false
+        titleLbl.refusesFirstResponder = true
+
+        var subtitleParts: [String] = []
+        if !track.artist.isEmpty { subtitleParts.append(track.artist) }
+        if !track.album.isEmpty { subtitleParts.append(track.album) }
+        if !track.duration.isEmpty { subtitleParts.append(track.duration) }
+        if subtitleParts.isEmpty { subtitleParts.append("YouTube Music") }
+
+        let metaLbl = NSTextField(labelWithString: subtitleParts.joined(separator: " • "))
+        metaLbl.font = NSFont.systemFont(ofSize: 9.5, weight: .regular)
+        metaLbl.textColor = tone.secondaryText
+        metaLbl.maximumNumberOfLines = 1
+        metaLbl.usesSingleLineMode = true
+        metaLbl.lineBreakMode = .byTruncatingTail
+        metaLbl.isEditable = false
+        metaLbl.isSelectable = false
+        metaLbl.refusesFirstResponder = true
+
+        let textCol = NSStackView(views: [titleLbl, metaLbl])
+        textCol.orientation = .vertical
+        textCol.alignment = .leading
+        textCol.spacing = 0
+        textCol.translatesAutoresizingMaskIntoConstraints = false
+
+        let addBtn = ReactiveIconButton()
+        addBtn.translatesAutoresizingMaskIntoConstraints = false
+        addBtn.isBordered = false
+        addBtn.representedObject = track
+        let addConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .bold)
+        addBtn.image = NSImage(systemSymbolName: "plus", accessibilityDescription: "Add to Playlist")?.withSymbolConfiguration(addConfig)
+        addBtn.contentTintColor = rowPlayIconColor(tone: tone)
+        addBtn.toolTip = playlistAddMode ? "Add to \"\(playlistDetailMode?.name ?? "playlist")\"" : "Add to Playlist"
+        addBtn.target = self
+        addBtn.action = #selector(handleAddSearchYTMTrack(_:))
+        addBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        addBtn.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        row.addSubview(playBtn)
+        row.addSubview(textCol)
+        row.addSubview(addBtn)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 40),
+            playBtn.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            playBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            textCol.leadingAnchor.constraint(equalTo: playBtn.trailingAnchor, constant: 8),
+            textCol.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            textCol.trailingAnchor.constraint(lessThanOrEqualTo: addBtn.leadingAnchor, constant: -6),
+            addBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+            addBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+        return row
+    }
+
+    private func makeSearchYTMPlaylistRow(playlist: YTMClient.SearchPlaylistResult, badgeText: String, tone: SettingsTone) -> NSView {
+        let isLiquidDark = (PlayerDesign.current == .liquidFluid && SystemAppearanceHelper.isDarkSystemAppearance)
+        let row = InteractiveSearchCardView()
+        row.wantsLayer = true
+        row.layer?.cornerRadius = 14
+        row.layer?.borderWidth = 1.0
+        row.layer?.borderColor = (isLiquidDark ? NSColor(white: 1.0, alpha: 0.20) : tone.dividerColor).cgColor
+        row.layer?.backgroundColor = (isLiquidDark ? NSColor(white: 1.0, alpha: 0.16) : (tone == .light ? NSColor(white: 0.0, alpha: 0.04) : NSColor(white: 1.0, alpha: 0.06))).cgColor
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.onClick = { [weak self] in
+            self?.importAndOpenSearchYTMPlaylist(playlist, openAfterImport: true)
+        }
+
+        let artworkView = NSImageView()
+        artworkView.translatesAutoresizingMaskIntoConstraints = false
+        artworkView.imageScaling = .scaleProportionallyDown
+        artworkView.wantsLayer = true
+        artworkView.layer?.cornerRadius = 7
+        artworkView.layer?.masksToBounds = true
+        artworkView.layer?.backgroundColor = (tone == .light ? NSColor(white: 0.0, alpha: 0.06) : NSColor(white: 1.0, alpha: 0.08)).cgColor
+        let placeholderConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        artworkView.image = NSImage(systemSymbolName: "music.note.list", accessibilityDescription: nil)?.withSymbolConfiguration(placeholderConfig)
+        artworkView.contentTintColor = rowPlayIconColor(tone: tone)
+        if !playlist.artworkUrl.isEmpty, let url = URL(string: playlist.artworkUrl), url.scheme?.hasPrefix("http") == true {
+            URLSession.shared.dataTask(with: url) { [weak artworkView] data, _, _ in
+                guard let data = data, let img = NSImage(data: data) else { return }
+                DispatchQueue.main.async {
+                    artworkView?.image = img
+                }
+            }.resume()
+        }
+
+        let titleLbl = NSTextField(labelWithString: playlist.title)
+        titleLbl.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        titleLbl.textColor = tone.primaryText
+        titleLbl.maximumNumberOfLines = 1
+        titleLbl.usesSingleLineMode = true
+        titleLbl.lineBreakMode = .byTruncatingTail
+        titleLbl.isEditable = false
+        titleLbl.isSelectable = false
+        titleLbl.refusesFirstResponder = true
+
+        var metaParts: [String] = []
+        if !playlist.author.isEmpty { metaParts.append(playlist.author) }
+        if !playlist.trackCountText.isEmpty { metaParts.append(playlist.trackCountText) }
+        if metaParts.isEmpty { metaParts.append(badgeText) }
+
+        let metaLbl = NSTextField(labelWithString: metaParts.joined(separator: " • "))
+        metaLbl.font = NSFont.systemFont(ofSize: 9.5, weight: .regular)
+        metaLbl.textColor = tone.secondaryText
+        metaLbl.maximumNumberOfLines = 1
+        metaLbl.usesSingleLineMode = true
+        metaLbl.lineBreakMode = .byTruncatingTail
+        metaLbl.isEditable = false
+        metaLbl.isSelectable = false
+        metaLbl.refusesFirstResponder = true
+
+        let textCol = NSStackView(views: [titleLbl, metaLbl])
+        textCol.orientation = .vertical
+        textCol.alignment = .leading
+        textCol.spacing = 0
+        textCol.translatesAutoresizingMaskIntoConstraints = false
+
+        let importBtn = ReactiveIconButton()
+        importBtn.translatesAutoresizingMaskIntoConstraints = false
+        importBtn.isBordered = false
+        importBtn.representedObject = playlist
+        let importConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .bold)
+        importBtn.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: "Save Playlist")?.withSymbolConfiguration(importConfig)
+        importBtn.contentTintColor = rowPlayIconColor(tone: tone)
+        importBtn.toolTip = "Save to Your Playlists"
+        importBtn.target = self
+        importBtn.action = #selector(handleImportSearchYTMPlaylist(_:))
+        importBtn.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        importBtn.heightAnchor.constraint(equalToConstant: 22).isActive = true
+
+        row.addSubview(artworkView)
+        row.addSubview(textCol)
+        row.addSubview(importBtn)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 44),
+            artworkView.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            artworkView.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            artworkView.widthAnchor.constraint(equalToConstant: 30),
+            artworkView.heightAnchor.constraint(equalToConstant: 30),
+            textCol.leadingAnchor.constraint(equalTo: artworkView.trailingAnchor, constant: 8),
+            textCol.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            textCol.trailingAnchor.constraint(lessThanOrEqualTo: importBtn.leadingAnchor, constant: -6),
+            importBtn.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+            importBtn.centerYAnchor.constraint(equalTo: row.centerYAnchor)
+        ])
+        return row
     }
 
     private func scheduleIncrementalBuild(_ builders: [() -> NSView], itemIDs: [String] = [], into stack: NSStackView, initialBatchSize: Int = 35) {
@@ -648,7 +1317,7 @@ extension DynamicIslandPlayerView {
         guard !storedOrder.isEmpty else { return items }
         var rank: [String: Int] = [:]
         for (i, k) in storedOrder.enumerated() { rank[k] = i }
-        let ordered = items.filter { rank[key($0)] != nil }.sorted { (rank[key($0)]!) < (rank[key($1)]!) }
+        let ordered = items.filter { rank[key($0)] != nil }.sorted { (rank[key($0)] ?? 0) < (rank[key($1)] ?? 0) }
         let rest = items.filter { rank[key($0)] == nil }
         return rest + ordered
     }
@@ -767,7 +1436,8 @@ extension DynamicIslandPlayerView {
     }
 
     private func renderPlaylistDetail(_ playlist: PlaylistRecord, tone: SettingsTone, filterQuery: String) {
-        let trimmedQuery = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanQuery = filterQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedQuery = cleanQuery.lowercased()
         playlistSectionLabel.stringValue = playlist.name.uppercased()
         playlistHeaderStack?.isHidden = false
         playlistDetailBackButton.isHidden = false
@@ -793,18 +1463,20 @@ extension DynamicIslandPlayerView {
             playlistDetailDownloadAllButton.isHidden = true
             playlistActionRowStack?.isHidden = true
             if let search = playlistSearchField {
-                search.placeholderString = "Search all songs..."
+                search.placeholderString = "Search account & YouTube Music..."
             }
             playlistsStackView.isHidden = true
             detailStackView.isHidden = false
             playlistScrollView?.isHidden = false
 
-            var tracks = LocalLibraryManager.shared.allTracks
             if !trimmedQuery.isEmpty {
-                tracks = tracks.filter { $0.title.lowercased().contains(trimmedQuery) || $0.artist.lowercased().contains(trimmedQuery) }
+                renderSectionedAddSongsSearch(query: cleanQuery, lowerQuery: trimmedQuery, tone: tone)
+                return
             }
+
+            let tracks = LocalLibraryManager.shared.allTracks
             if tracks.isEmpty {
-                let emptyLabel = NSTextField(labelWithString: trimmedQuery.isEmpty ? "No songs found in local library" : "No matching songs")
+                let emptyLabel = NSTextField(labelWithString: "Type above to search Your Account & YouTube Music")
                 emptyLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
                 emptyLabel.textColor = tone.secondaryText
                 emptyLabel.isEditable = false
@@ -912,6 +1584,7 @@ extension DynamicIslandPlayerView {
                 self.refreshPlaylistsSection()
                 self.updateSettingsThemeHighlight()
             } else {
+                self.resetPlaylistSearchState()
                 self.playlistDetailMode = playlist
                 self.playlistAddMode = false
                 self.isPlaylistSearchActive = true
@@ -1483,7 +2156,7 @@ extension DynamicIslandPlayerView {
         }
         let tracks = resolveHistoryTracks(records)
         if tracks.isEmpty {
-            if let vid = records.first(where: { $0.ytVideoId != nil && !$0.ytVideoId!.isEmpty })?.ytVideoId {
+            if let vid = records.compactMap(\.ytVideoId).first(where: { !$0.isEmpty }) {
                 NowPlayingManager.shared.switchToOnlineMode()
                 PlaylistManager.shared.playOnlineVideo(videoId: vid)
             } else {
@@ -1503,7 +2176,7 @@ extension DynamicIslandPlayerView {
         }
         let tracks = resolveHistoryTracks(records)
         if tracks.isEmpty {
-            if let vid = records.first(where: { $0.ytVideoId != nil && !$0.ytVideoId!.isEmpty })?.ytVideoId {
+            if let vid = records.compactMap(\.ytVideoId).first(where: { !$0.isEmpty }) {
                 NowPlayingManager.shared.switchToOnlineMode()
                 PlaylistManager.shared.playOnlineVideo(videoId: vid)
             } else {

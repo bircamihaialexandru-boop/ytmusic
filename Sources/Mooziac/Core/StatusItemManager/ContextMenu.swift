@@ -177,6 +177,16 @@ extension StatusItemManager {
         
         let menu = NSMenu()
         
+        let pinRes = makeCapsuleToggleMenuItem(
+            title: "Pin Player on Top",
+            isOn: isPinnedOnTop,
+            onToggle: { [weak self] enabled in
+                self?.setPinnedOnTop(enabled)
+            }
+        )
+        menu.addItem(pinRes.menuItem)
+        menu.addItem(NSMenuItem.separator())
+        
         let gestureMenu = NSMenu()
         
         var volumeSwipeToggle: NativeCapsuleToggleView?

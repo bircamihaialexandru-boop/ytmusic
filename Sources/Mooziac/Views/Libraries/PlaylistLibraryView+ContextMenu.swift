@@ -15,8 +15,82 @@ extension PlaylistLibraryView {
 
         switch mode {
         case .list:
-            guard row < filteredPlaylists.count else { return nil }
-            let playlist = filteredPlaylists[row]
+            let playlist: PlaylistRecord
+            if isPlaylistListSearchActive {
+                guard row < playlistSearchItems.count else { return nil }
+                switch playlistSearchItems[row] {
+                case .sectionHeader, .status:
+                    return nil
+                case .localPlaylist(let pl):
+                    playlist = pl
+                case .accountTrack(let item):
+                    let playItem = NSMenuItem(title: "Play Track", action: #selector(handleLibraryPlaySearchAccountTrackItem(_:)), keyEquivalent: "")
+                    playItem.target = self
+                    playItem.representedObject = item
+                    menu.addItem(playItem)
+
+                    let playlists = PlaylistManager.shared.fetchPlaylists()
+                    let addToPlaylistItem = NSMenuItem(title: "Add to Playlist", action: nil, keyEquivalent: "")
+                    let playlistSubmenu = NSMenu(title: "Playlists")
+                    for pl in playlists {
+                        let subItem = NSMenuItem(title: pl.name, action: #selector(handleLibraryAddSearchAccountTrackToPlaylist(_:)), keyEquivalent: "")
+                        subItem.target = self
+                        subItem.representedObject = ["item": item, "playlistID": pl.id]
+                        playlistSubmenu.addItem(subItem)
+                    }
+                    if !playlists.isEmpty {
+                        playlistSubmenu.addItem(NSMenuItem.separator())
+                    }
+                    let newPLItem = NSMenuItem(title: "+ New Playlist…", action: #selector(handleLibraryNewPlaylistWithSearchAccountTrack(_:)), keyEquivalent: "")
+                    newPLItem.target = self
+                    newPLItem.representedObject = item
+                    playlistSubmenu.addItem(newPLItem)
+                    addToPlaylistItem.submenu = playlistSubmenu
+                    menu.addItem(addToPlaylistItem)
+                    return menu
+
+                case .ytmTrack(let track):
+                    let playItem = NSMenuItem(title: "Play on YouTube Music", action: #selector(handleLibraryPlaySearchYTMTrackItem(_:)), keyEquivalent: "")
+                    playItem.target = self
+                    playItem.representedObject = track
+                    menu.addItem(playItem)
+
+                    let playlists = PlaylistManager.shared.fetchPlaylists()
+                    let addToPlaylistItem = NSMenuItem(title: "Add to Playlist", action: nil, keyEquivalent: "")
+                    let playlistSubmenu = NSMenu(title: "Playlists")
+                    for pl in playlists {
+                        let subItem = NSMenuItem(title: pl.name, action: #selector(handleLibraryAddSearchYTMTrackToPlaylist(_:)), keyEquivalent: "")
+                        subItem.target = self
+                        subItem.representedObject = ["track": track, "playlistID": pl.id]
+                        playlistSubmenu.addItem(subItem)
+                    }
+                    if !playlists.isEmpty {
+                        playlistSubmenu.addItem(NSMenuItem.separator())
+                    }
+                    let newPLItem = NSMenuItem(title: "+ New Playlist…", action: #selector(handleLibraryNewPlaylistWithSearchYTMTrack(_:)), keyEquivalent: "")
+                    newPLItem.target = self
+                    newPLItem.representedObject = track
+                    playlistSubmenu.addItem(newPLItem)
+                    addToPlaylistItem.submenu = playlistSubmenu
+                    menu.addItem(addToPlaylistItem)
+                    return menu
+
+                case .ytmPlaylist(let ytmPL, _):
+                    let openItem = NSMenuItem(title: "Import & Open Playlist", action: #selector(handleLibraryImportAndOpenSearchYTMPlaylistItem(_:)), keyEquivalent: "")
+                    openItem.target = self
+                    openItem.representedObject = ytmPL
+                    menu.addItem(openItem)
+
+                    let saveItem = NSMenuItem(title: "Save to Your Playlists", action: #selector(handleLibraryImportSearchYTMPlaylistItem(_:)), keyEquivalent: "")
+                    saveItem.target = self
+                    saveItem.representedObject = ytmPL
+                    menu.addItem(saveItem)
+                    return menu
+                }
+            } else {
+                guard row < filteredPlaylists.count else { return nil }
+                playlist = filteredPlaylists[row]
+            }
 
             let openItem = NSMenuItem(title: "Open Playlist", action: #selector(handleContextOpenPlaylist(_:)), keyEquivalent: "")
             openItem.target = self

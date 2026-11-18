@@ -6,10 +6,57 @@ extension PlaylistLibraryView {
 
     public func controlTextDidChange(_ obj: Notification) {
         currentSearchQuery = searchField.stringValue
+        let clean = currentSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        ytmSearchDebounceWork?.cancel()
+        ytmSearchGeneration &+= 1
+
+        if case .list = mode {
+            if clean.isEmpty {
+                cachedYTMSearchQuery = ""
+                cachedYTMSearchResults = nil
+                isYTMSearchLoading = false
+            } else if !URLFilter.containsLink(clean) {
+                let hasFreshCache = (clean.caseInsensitiveCompare(cachedYTMSearchQuery) == .orderedSame && cachedYTMSearchResults != nil)
+                if !hasFreshCache {
+                    cachedYTMSearchResults = nil
+                    isYTMSearchLoading = NetworkMonitor.shared.isReachable
+                }
+
+                if NetworkMonitor.shared.isReachable && !hasFreshCache {
+                    let generation = ytmSearchGeneration
+                    let work = DispatchWorkItem { [weak self] in
+                        YTMClient.shared.searchYouTubeMusic(query: clean) { result in
+                            DispatchQueue.main.async {
+                                guard let self = self, self.ytmSearchGeneration == generation else { return }
+                                self.isYTMSearchLoading = false
+                                self.cachedYTMSearchQuery = clean
+                                if case .success(let searchResults) = result {
+                                    self.cachedYTMSearchResults = searchResults
+                                }
+                                let activeQuery = self.searchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if activeQuery.caseInsensitiveCompare(clean) == .orderedSame,
+                                   case .list = self.mode {
+                                    self.currentSearchQuery = self.searchField.stringValue
+                                    self.applyFilter()
+                                    self.emptyStateView.isHidden = !self.playlistSearchItems.isEmpty
+                                    self.tableView.reloadData()
+                                }
+                            }
+                        }
+                    }
+                    ytmSearchDebounceWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.32, execute: work)
+                }
+            } else {
+                isYTMSearchLoading = false
+            }
+        }
+
         applyFilter()
         switch mode {
         case .list:
-            emptyStateView.isHidden = !filteredPlaylists.isEmpty
+            emptyStateView.isHidden = isPlaylistListSearchActive ? !playlistSearchItems.isEmpty : !filteredPlaylists.isEmpty
         case .detail:
             emptyStateView.isHidden = !filteredPlaylistItems.isEmpty
         case .likedSongs:
@@ -45,7 +92,7 @@ extension PlaylistLibraryView {
 
     public func numberOfRows(in tableView: NSTableView) -> Int {
         switch mode {
-        case .list: return filteredPlaylists.count
+        case .list: return isPlaylistListSearchActive ? playlistSearchItems.count : filteredPlaylists.count
         case .detail: return filteredPlaylistItems.count
         case .likedSongs: return filteredLikedSongs.count
         case .downloads: return filteredDownloads.count
@@ -54,7 +101,56 @@ extension PlaylistLibraryView {
     }
 
     public func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        if case .list = mode, isPlaylistListSearchActive, row < playlistSearchItems.count {
+            switch playlistSearchItems[row] {
+            case .sectionHeader: return 22
+            case .status: return 26
+            case .localPlaylist, .ytmPlaylist: return 42
+            case .accountTrack, .ytmTrack: return 40
+            }
+        }
         return 40
+    }
+
+    private func makePlaylistRowCell(for playlist: PlaylistRecord, design: PlayerDesign) -> PlaylistRowCellView? {
+        let cellID = NSUserInterfaceItemIdentifier("PlaylistRowCell")
+        var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? PlaylistRowCellView
+        if cell == nil {
+            cell = PlaylistRowCellView()
+            cell?.identifier = cellID
+        }
+        let summary = PlaylistManager.shared.summaryForPlaylist(playlist)
+        cell?.configure(playlist: playlist, summary: summary, design: design)
+        cell?.onRowClicked = { [weak self] in
+            self?.mode = .detail(playlist)
+        }
+        cell?.onRename = { [weak self] in
+            guard let self = self else { return }
+            self.promptForName(title: "Rename Playlist", defaultName: playlist.name, actionTitle: "Rename") { [weak self] name in
+                let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
+                if trimmed != playlist.name {
+                    PlaylistManager.shared.renamePlaylist(id: playlist.id, name: trimmed)
+                    CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "✓ Renamed to \"\(trimmed)\"")
+                }
+                self?.reload()
+            }
+        }
+        cell?.onDelete = { [weak self] in
+            self?.confirmAndDeletePlaylist(playlist)
+        }
+        cell?.onRightSwipePlay = { [weak self] in
+            guard let self = self else { return false }
+            let items = PlaylistManager.shared.fetchPlaylistItems(playlistID: playlist.id)
+            if items.isEmpty {
+                CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "⚠️ \"\(playlist.name)\" is empty")
+                return false
+            }
+            self.playPlaylist(playlistID: playlist.id, startingAt: nil)
+            CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "▶ Playing \"\(playlist.name)\"")
+            return true
+        }
+        return cell
     }
 
     public func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -62,46 +158,89 @@ extension PlaylistLibraryView {
 
         switch mode {
         case .list:
-            guard row < filteredPlaylists.count else { return nil }
-            let playlist = filteredPlaylists[row]
-            let cellID = NSUserInterfaceItemIdentifier("PlaylistRowCell")
-            var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? PlaylistRowCellView
-            if cell == nil {
-                cell = PlaylistRowCellView()
-                cell?.identifier = cellID
-            }
-            let summary = PlaylistManager.shared.summaryForPlaylist(playlist)
-            cell?.configure(playlist: playlist, summary: summary, design: design)
-            cell?.onRowClicked = { [weak self] in
-                self?.mode = .detail(playlist)
-            }
-            cell?.onRename = { [weak self] in
-                guard let self = self else { return }
-                self.promptForName(title: "Rename Playlist", defaultName: playlist.name, actionTitle: "Rename") { [weak self] name in
-                    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !trimmed.isEmpty else { return }
-                    if trimmed != playlist.name {
-                        PlaylistManager.shared.renamePlaylist(id: playlist.id, name: trimmed)
-                        CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "✓ Renamed to \"\(trimmed)\"")
+            if isPlaylistListSearchActive {
+                guard row < playlistSearchItems.count else { return nil }
+                switch playlistSearchItems[row] {
+                case .sectionHeader(let title):
+                    let cellID = NSUserInterfaceItemIdentifier("SearchSectionHeaderCell")
+                    var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? PlaylistSearchSectionHeaderCellView
+                    if cell == nil {
+                        cell = PlaylistSearchSectionHeaderCellView()
+                        cell?.identifier = cellID
                     }
-                    self?.reload()
+                    cell?.configure(title: title, design: design)
+                    return cell
+
+                case .status(let text):
+                    let cellID = NSUserInterfaceItemIdentifier("SearchStatusCell")
+                    var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? PlaylistSearchStatusCellView
+                    if cell == nil {
+                        cell = PlaylistSearchStatusCellView()
+                        cell?.identifier = cellID
+                    }
+                    cell?.configure(text: text, design: design)
+                    return cell
+
+                case .localPlaylist(let playlist):
+                    return makePlaylistRowCell(for: playlist, design: design)
+
+                case .accountTrack(let item):
+                    let cellID = NSUserInterfaceItemIdentifier("SearchTrackCell")
+                    var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? PlaylistSearchTrackCellView
+                    if cell == nil {
+                        cell = PlaylistSearchTrackCellView()
+                        cell?.identifier = cellID
+                    }
+                    let artistPart = item.artist.isEmpty ? "YouTube Music" : item.artist
+                    cell?.configure(title: item.title, subtitle: "\(artistPart) • \(item.sourceLabel)", design: design)
+                    cell?.onPlay = { [weak self] in
+                        self?.playSearchAccountTrack(item)
+                    }
+                    cell?.onAddTapped = { [weak self] sender in
+                        self?.showAddSearchAccountTrackMenu(item, from: sender)
+                    }
+                    return cell
+
+                case .ytmPlaylist(let playlist, let badge):
+                    let cellID = NSUserInterfaceItemIdentifier("SearchPlaylistCell")
+                    var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? PlaylistSearchPlaylistCellView
+                    if cell == nil {
+                        cell = PlaylistSearchPlaylistCellView()
+                        cell?.identifier = cellID
+                    }
+                    cell?.configure(playlist: playlist, badge: badge, design: design)
+                    cell?.onOpenPlaylist = { [weak self] in
+                        self?.importAndOpenSearchYTMPlaylist(playlist, openAfterImport: true)
+                    }
+                    cell?.onImportTapped = { [weak self] in
+                        self?.importAndOpenSearchYTMPlaylist(playlist, openAfterImport: false)
+                    }
+                    return cell
+
+                case .ytmTrack(let track):
+                    let cellID = NSUserInterfaceItemIdentifier("SearchTrackCell")
+                    var cell = tableView.makeView(withIdentifier: cellID, owner: self) as? PlaylistSearchTrackCellView
+                    if cell == nil {
+                        cell = PlaylistSearchTrackCellView()
+                        cell?.identifier = cellID
+                    }
+                    var parts: [String] = []
+                    if !track.artist.isEmpty { parts.append(track.artist) }
+                    if !track.album.isEmpty { parts.append(track.album) }
+                    if !track.duration.isEmpty { parts.append(track.duration) }
+                    if parts.isEmpty { parts.append("YouTube Music") }
+                    cell?.configure(title: track.title, subtitle: parts.joined(separator: " • "), design: design)
+                    cell?.onPlay = { [weak self] in
+                        self?.playSearchYTMTrack(track)
+                    }
+                    cell?.onAddTapped = { [weak self] sender in
+                        self?.showAddSearchYTMTrackMenu(track, from: sender)
+                    }
+                    return cell
                 }
             }
-            cell?.onDelete = { [weak self] in
-                self?.confirmAndDeletePlaylist(playlist)
-            }
-            cell?.onRightSwipePlay = { [weak self] in
-                guard let self = self else { return false }
-                let items = PlaylistManager.shared.fetchPlaylistItems(playlistID: playlist.id)
-                if items.isEmpty {
-                    CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "⚠️ \"\(playlist.name)\" is empty")
-                    return false
-                }
-                self.playPlaylist(playlistID: playlist.id, startingAt: nil)
-                CenteredMenuBarLyricsWindowController.shared.showCustomTextOverlay(text: "▶ Playing \"\(playlist.name)\"")
-                return true
-            }
-            return cell
+            guard row < filteredPlaylists.count else { return nil }
+            return makePlaylistRowCell(for: filteredPlaylists[row], design: design)
 
         case .detail(let playlist):
             guard row < filteredPlaylistItems.count else { return nil }
@@ -204,8 +343,15 @@ extension PlaylistLibraryView {
 
         switch mode {
         case .list:
-            guard row < filteredPlaylists.count else { return [] }
-            let playlist = filteredPlaylists[row]
+            let playlist: PlaylistRecord
+            if isPlaylistListSearchActive {
+                guard row < playlistSearchItems.count,
+                      case .localPlaylist(let matched) = playlistSearchItems[row] else { return [] }
+                playlist = matched
+            } else {
+                guard row < filteredPlaylists.count else { return [] }
+                playlist = filteredPlaylists[row]
+            }
             let deleteAction = NSTableViewRowAction(style: .destructive, title: "Delete") { [weak self] _, _ in
                 self?.confirmAndDeletePlaylist(playlist)
             }
